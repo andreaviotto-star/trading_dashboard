@@ -109,8 +109,20 @@ DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 # real cost -- it's only the flat exchange/clearing fee; the statement's
 # real total also includes NFA/broker markup, which is why these defaults
 # must come from statement_fee, not fills_fee_reconstructed.
+# Legacy fallbacks (kept for compatibility if a mapping isn't provided)
 COMMISSION_PER_MICRO = 0.88
 COMMISSION_PER_MINI  = 3.31
+
+# Per-contract round-trip commission rates ($/contract RT)
+# Updated to values provided by the user.
+COMMISSION_RATES = {
+    "MES": 1.74,
+    "MNQ": 1.73,
+    "MGC": 2.45,
+    "NQ":  5.00,
+    "GC":  5.54,
+    "CL":  5.31,
+}
 
 MICRO_PREFIXES = {"MES", "MNQ", "MGC", "MCL"}
 FALLBACK_CTYPE = {"ES": "MES", "NQ": "MNQ", "GC": "MGC", "CL": "CL"}
@@ -430,7 +442,7 @@ _LOAD_VERSION = 6   # bump this integer to force a full cache clear
                     # (bumped 5→6: adds .csv strategy-file support below)
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def load_all_systems(data_dir: str, comm_micro: float, comm_mini: float,
+def load_all_systems(data_dir: str, comm_rates: dict | None,
                      _version: int = _LOAD_VERSION):
     """
     Cached with st.cache_data (TTL 24 h).
@@ -505,7 +517,17 @@ def load_all_systems(data_dir: str, comm_micro: float, comm_mini: float,
             alloc    = get_alloc(stem)
             ctype    = alloc["ctype"]
             is_micro = ctype in MICRO_PREFIXES
-            comm_rt  = comm_micro if is_micro else comm_mini
+            # Determine per-contract round-trip commission: prefer explicit
+            # mapping passed in `comm_rates`, otherwise fall back to the
+            # legacy micro/mini constants.
+            comm_rt = None
+            if isinstance(comm_rates, dict):
+                # Exact token match first
+                comm_rt = comm_rates.get(ctype)
+                # If not found and it's a micro prefix like 'MES', allow
+                # matching the short token (e.g., 'MES' already)
+            if comm_rt is None:
+                comm_rt = COMMISSION_PER_MICRO if is_micro else COMMISSION_PER_MINI
 
             systems[stem] = {
                 # ── Identity ──────────────────────────────────────────────
@@ -1368,18 +1390,14 @@ with st.sidebar:
     lookback       = st.slider("Lookback (years)", 1, 10, 10)
     st.divider()
     st.caption("**Commission rates ($/contract, round-trip)**")
-    COMMISSION_PER_MICRO = st.number_input("Micro ($/contract)",     value=0.88, step=0.05,
-        help="Charged per contract, not per trade -- a 3-lot trade costs 3x this. "
-             "Default $0.88 is blended from Andrea's real June 2026 statement "
-             "(MES/MNQ/MGC fee-lines / contracts traded, volume-weighted). Corrected "
-             "2026-07: the previous $1.75 default was ~2x this, calibrated against "
-             "the order-history file's flat exchange fee instead of the statement's "
-             "real (higher, NFA/broker-inclusive) cost.")
-    COMMISSION_PER_MINI  = st.number_input("Mini/Full ($/contract)", value=3.31, step=0.05,
-        help="Charged per contract, not per trade. Default $3.31 is blended from "
-             "the real June 2026 statement (CL/GC/NQ fee-lines / contracts traded, "
-             "volume-weighted). Corrected 2026-07: the previous $6.60 default was "
-             "~2x this, same root cause as the micro default above.")
+    st.write("Edit per-contract round-trip commission rates below. These are applied as `rate * n_contracts` for each trade.")
+    # UI order for contract types
+    _contract_order = ["MES", "MNQ", "MGC", "NQ", "GC", "CL"]
+    commission_rates = {}
+    for token in _contract_order:
+        default_val = COMMISSION_RATES.get(token, (COMMISSION_PER_MICRO if token in MICRO_PREFIXES else COMMISSION_PER_MINI))
+        commission_rates[token] = st.number_input(f"{token} ($/contract)", value=float(default_val), step=0.01, key=f"comm_{token}")
+    st.divider()
     st.divider()
     st.caption("**Risk Parity**")
     rp_target = st.number_input("Target daily risk/system ($)",
@@ -1395,8 +1413,9 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 
 with st.spinner("Loading trading systems from raw trades…"):
+    # pass the user-edited commission mapping into the loader
     systems, load_warnings = load_all_systems(
-        data_dir_input, COMMISSION_PER_MICRO, COMMISSION_PER_MINI,
+        data_dir_input, commission_rates,
         _version=_LOAD_VERSION)
 
 if not systems:

@@ -197,6 +197,51 @@ Tabella riassuntiva che combina il semaforo di salute con una raccomandazione pr
 - 🔴 In difficoltà → "Considera di ridurre a N o mettere in pausa"
 
 ### 🌡️ Analisi del Regime di Mercato
+\
+---
+## 💸 Commissioni per contratto (Round-Trip)
+
+Le commissioni usate dal dashboard sono ora espresse come **$/contratto round-trip**
+per tipo di contratto. Questo significa che il costo addebitato a ogni trade viene
+calcolato come: `comm_per_contract * n_contracts` e sottratto dal P&L prima di
+calcolare gli indicatori e le equity curve.
+
+Valori correnti (aggiornati):
+
+| Contratto | Codice | Commissione $/ct (RT) |
+|---:|:---:|---:|
+| MES (micro ES) | MES | $1.74 |
+| MNQ (micro NQ) | MNQ | $1.73 |
+| MGC (micro GC) | MGC | $2.45 |
+| NQ (full/mini NQ) | NQ | $5.00 |
+| GC (full Gold) | GC | $5.54 |
+| CL (full Crude) | CL | $5.31 |
+
+Dove modificare i valori:
+
+- I valori sono centralizzati nella costante `COMMISSION_RATES` in `app.py`.
+- Per cambiare una commissione, modifica `COMMISSION_RATES` e riavvia il
+	dashboard (Streamlit ricarica automaticamente i file cambiati).
+
+Esempio rapido (in `app.py`):
+
+```python
+COMMISSION_RATES = {
+		"MES": 1.74,
+		"MNQ": 1.73,
+		"MGC": 2.45,
+		"NQ":  5.00,
+		"GC":  5.54,
+		"CL":  5.31,
+}
+```
+
+Note:
+- Se non è presente una voce esplicita per un certo `ctype`, il loader usa un
+	fallback: `COMMISSION_PER_MICRO` o `COMMISSION_PER_MINI` (sempre in `app.py`).
+- Le commissioni sono interpretate come round-trip (entrata + uscita), quindi
+	non vanno raddoppiate di nuovo quando applicate.
+
 
 **Cos'è un regime di mercato?** Il mercato non si comporta sempre allo stesso modo. Ci sono periodi di bassa volatilità (mercato tranquillo) e periodi di alta volatilità (mercato turbolento).
 

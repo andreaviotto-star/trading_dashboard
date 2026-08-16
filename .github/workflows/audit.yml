@@ -1,0 +1,48 @@
+name: Quant Dashboard Audit
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'app.py'
+      - 'audit.py'
+      - 'golden_master.py'
+      - 'diff_golden_master.py'
+      - '.github/workflows/audit.yml'
+  push:
+    branches: [main, 'agent/**']
+    paths:
+      - 'app.py'
+      - 'audit.py'
+      - 'golden_master.py'
+      - 'diff_golden_master.py'
+      - '.github/workflows/audit.yml'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install audit dependencies
+        run: python -m pip install --upgrade pip pandas numpy
+
+      - name: Run consolidated audit
+        run: python audit.py
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quant-dashboard-audit
+          path: |
+            audit_report.md
+            audit_result.json
+            .audit_post.csv
+          if-no-files-found: ignore

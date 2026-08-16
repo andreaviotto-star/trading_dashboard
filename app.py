@@ -1,11 +1,34 @@
 """
-Quant Trading System Analytics Dashboard  v11.0
+Quant Trading System Analytics Dashboard  v25.1
 =================================================
 Usage: streamlit run app.py
 
 ═══════════════════════════════════════════════════════════════
-CHANGES IN v11.0
+CHANGES IN v25.0
 ═══════════════════════════════════════════════════════════════
+  • Correlation audit uses overlapping daily dollar P&L observations; no invented zero P&L for pre-launch periods
+  • Portfolio volatility, sum of individual volatility and diversification ratio
+  • System and correlation-cluster risk contributions
+  • Rolling average-correlation diagnostic
+  • Correlation-aware Risk Parity retained alongside volatility-only Risk Parity
+  • Regime-conditioned Monte Carlo using empirical volatility-regime transitions
+  • Tooltip descriptions formatted as separate Formula / Purpose / In plain English paragraphs
+
+CHANGES IN v25.1 — 2026-08-16
+═══════════════════════════════════════════════════════════════
+  • Fixed correlation clustering by restoring fcluster and surfacing analytical exceptions
+  • Portfolio Impact now compares current vs advisory sizing on the same estimator/window/system set
+  • Tab 2 risk follows the selected system set and selected date window
+  • Removed tab-level st.stop() flow; empty selections now return from the tab renderer only
+  • Added canonical portfolio_risk() engine for diversified daily risk and risk contributions
+  • Added constant-composition analytics toggle (default ON) and live-system-count diagnostic
+  • Added daily/weekly/monthly correlation comparison; monthly is the primary diversification horizon
+  • Added Ledoit-Wolf covariance shrinkage and covariance-quality diagnostics for sizing
+  • Correlation-aware Risk Parity now requires 252 complete observations and uses shrunk covariance
+  • Corrected stale Ward labels and misleading cluster-risk wording
+  • Added golden_master.py for frozen-output regression testing
+  • Added standalone global matching and empirical-slippage modules; integration is gated on available source data
+
 
 1. DYNAMIC SIZING (Tab 1)
    - Per-system number_input in Tab 1 System Explorer.
@@ -75,8 +98,10 @@ import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import ColorScaleRule
-from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy.cluster.hierarchy import linkage, leaves_list, fcluster
 from scipy.spatial.distance import squareform
+from scipy.optimize import minimize
+from sklearn.covariance import LedoitWolf
 
 warnings.filterwarnings("ignore")
 
@@ -90,9 +115,17 @@ except Exception as _tsm_exc:
     tsm = None
     _TSM_IMPORT_ERROR = str(_tsm_exc)
 
+try:
+    import empirical_slippage as _emp_slip
+    _EMP_SLIP_IMPORT_ERROR = None
+except Exception as _emp_slip_exc:
+    _emp_slip = None
+    _EMP_SLIP_IMPORT_ERROR = str(_emp_slip_exc)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
+APP_VERSION = "v25.1"
 DATA_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
 # $/contract round-trip commission (NOT flat per-trade) -- see build_net_equity().
@@ -129,6 +162,201 @@ FALLBACK_CTYPE = {"ES": "MES", "NQ": "MNQ", "GC": "MGC", "CL": "CL"}
 
 COLORS = px.colors.qualitative.Plotly + px.colors.qualitative.Dark24
 THEME  = "plotly_white"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TABLE DISPLAY / FORMATTING
+# Presentation only: calculations retain full precision.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_money(v):
+    if pd.isna(v): return "—"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+
+
+def _fmt_money2(v):
+    if pd.isna(v): return "—"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return f"-${abs(v):,.2f}" if v < 0 else f"${v:,.2f}"
+
+
+def _fmt_number(v):
+    if pd.isna(v): return "—"
+    try:
+        return f"{float(v):,.0f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_decimal(v):
+    if pd.isna(v): return "—"
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_one_decimal(v):
+    if pd.isna(v): return "—"
+    try:
+        return f"{float(v):,.1f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_percent(v):
+    if pd.isna(v): return "—"
+    try:
+        return f"{float(v):.1%}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _fmt_price(v):
+    if pd.isna(v): return "—"
+    try:
+        return f"{float(v):,.2f}"
+    except (TypeError, ValueError):
+        return str(v)
+
+
+METRIC_HELP = {
+    'Account Balance': '**Purpose:** reference capital for risk/equity calculations. It does not change historical P&L.\n\n**In plain English:** this is the pot of money against which we judge how hard the portfolio is leaning on the account.',
+    'Net Profit ($)': '**Formula:** total net P&L after modeled commissions.\n\n**Purpose:** measure the actual dollars generated over the selected period.\n\n**In plain English:** how much money did the strategy put in the till?',
+    'Portfolio P&L': "**Formula:** sum of all selected systems' net P&L.\n\n**Purpose:** show the combined portfolio bottom line.\n\n**In plain English:** what did the whole trading desk make, not just one strategy?",
+    'Ann. P&L': '**Formula:** total P&L ÷ elapsed years.\n\n**Purpose:** put histories of different lengths onto a common annualized scale.\n\n**In plain English:** if this pace continued, roughly how much would the strategy make per year?',
+    'Max Drawdown': '**Formula:** largest peak-to-trough decline in cumulative P&L.\n\n**Purpose:** quantify the worst historical pain.\n\n**In plain English:** the number the risk committee remembers long after everyone has forgotten the Sharpe ratio.',
+    'P&L Sharpe': '**Formula:** mean daily P&L ÷ daily P&L volatility × √252.\n\n**Purpose:** measure P&L efficiency, not return on invested capital.\n\n**In plain English:** how much daily P&L are we getting for each unit of daily pain? A higher number means a smoother money-making machine.',
+    'Ann. P&L / Max DD': '**Formula:** annualized P&L ÷ absolute maximum drawdown.\n\n**Purpose:** measure annualized P&L generated per dollar of peak-to-trough pain.\n\n**In plain English:** how much money did we make for every dollar of historical suffering? Informally: the spleen-sanity ratio.',
+    'Profit Factor': '**Formula:** gross winning P&L ÷ gross losing P&L.\n\n**Purpose:** measure the payoff efficiency of the trade distribution.\n\n**In plain English:** for every $1 we lost, how many dollars did the winners make back? Above 1.0 means the winners paid the rent.',
+    'Win Rate': '**Formula:** profitable trades ÷ total trades.\n\n**Purpose:** show how often trades make money.\n\n**In plain English:** how often do we get to be right? A 40% win rate can still be excellent if the winners are much larger than the losers.',
+    'Current Daily Risk': '**Formula:** portfolio daily P&L volatility at the current contract sizing.\n\n**Purpose:** estimate normal one-day fluctuation, not a worst-case loss or margin requirement.\n\n**In plain English:** on a typical day, how much financial turbulence should we expect?',
+    'Daily Risk / Equity': "**Formula:** current daily P&L volatility ÷ account balance.\n\n**Purpose:** express daily portfolio risk as a percentage of capital.\n\n**In plain English:** what percentage of the account's equity is represented by one day's normal risk?",
+    'Annualized Risk / Equity': "**Formula:** annualized P&L volatility ÷ account balance.\n\n**Purpose:** provide a risk-leverage proxy relative to your capital.\n\n**In plain English:** if today's risk profile persisted, how volatile is this book relative to the size of the account?\n\n- This is **not** notional futures leverage.",
+    'Current Sizing': "**Reference point:** 100% means the contract counts currently selected in the Systems tab.\n\n**Purpose:** compare alternative allocations with the book you actually trade today.\n\n**In plain English:** today's portfolio is the benchmark; everything else is a what-if.",
+    'Current daily risk': "**Formula:** one-day portfolio P&L volatility at the current contract sizes.\n\n**Purpose:** quantify current risk budget usage.\n\n**In plain English:** how much turbulence are we buying with today's positions?",
+    'Current risk / equity': "**Formula:** current daily P&L volatility ÷ account balance.\n\n**Purpose:** compare today's risk with available capital.\n\n**In plain English:** how hard are we leaning on the account right now?",
+    'RP advisory daily risk': "**Formula:** portfolio daily P&L volatility if all Risk Parity Advisory contract counts were implemented.\n\n**Purpose:** show the portfolio's normal daily turbulence after the proposed sizing changes.\n\n**In plain English:** what would the book normally wobble by if we followed the recommendation?",
+    'RP risk / equity': "**Formula:** Risk Parity Advisory daily P&L volatility ÷ account balance.\n\n**Purpose:** compare the proposed allocation with available capital.\n\n**In plain English:** how much of the account's risk budget would the proposed book consume?",
+    'Current → RP annual risk': '**Formula:** annualized P&L volatility ÷ account balance for current and advisory sizing.\n\n**Purpose:** show the risk change before changing any contracts.\n\n**In plain English:** does the proposed makeover actually make the portfolio calmer, or are we just moving deck chairs?',
+     'Avg Pairwise ρ': '**Formula:** average correlation across valid overlapping daily P&L observations.\n\n**Purpose:** gauge broad co-movement between systems.\n\n**In plain English:** when one system has a bad day, how many of its friends tend to join the party?',
+    'Portfolio Daily Vol': '**Formula:** √(wᵀΣw), using the current-size daily P&L covariance matrix.\n\n**Purpose:** measure the actual one-day volatility of the combined portfolio after correlations are taken into account.\n\n**In plain English:** how much can the **whole book** normally wobble by?',
+    'Correlation-aware RP Daily Risk': '**Formula:** daily P&L volatility of the proposed integer contract allocation, including correlations.\n\n**Purpose:** show the actual portfolio risk produced by correlation-aware Risk Parity.\n\n**In plain English:** how much should the proposed whole book normally wobble by in a day?',
+    'Target daily risk': '**Formula:** account balance × target annualized risk ÷ √252.\n\n**Purpose:** convert the annual portfolio-risk target into a one-day P&L volatility target.\n\n**In plain English:** the daily risk budget implied by your 25% target.',
+    'Target annual risk': '**Formula:** annualized portfolio P&L volatility ÷ account balance.\n\n**Purpose:** show the annualized risk target used by the correlation-aware sizing calculation.\n\n**In plain English:** how much annual turbulence are we deliberately budgeting?',
+    'Resulting annual risk': '**Formula:** proposed portfolio daily volatility × √252 ÷ account balance.\n\n**Purpose:** show where the rounded whole-contract allocation actually lands relative to the target.\n\n**In plain English:** did whole contracts get us close to the risk budget?',
+    'Sum Individual Vol': "**Formula:** sum of each system's daily P&L volatility.\n\n**Purpose:** show the risk if every system moved in the same direction at the same time.\n\n**In plain English:** the scary version before diversification gets any credit.",
+    'Diversification Ratio': '**Formula:** sum of individual volatilities ÷ portfolio volatility.\n\n**Purpose:** quantify how much diversification reduces aggregate volatility.\n\n**In plain English:** how much risk reduction are we getting because the systems do **not** all move together?\n\n- **1.00** = essentially no diversification. Higher = more diversification.',
+    'Risk Contribution': "**Formula:** each system's marginal contribution to portfolio volatility × its current exposure.\n\n**Purpose:** identify which systems actually drive total portfolio risk after correlations.\n\n**In plain English:** who is paying most of the risk bill?\n\n- A system can be volatile on its own but contribute little if it diversifies the portfolio.",
+    'Cluster Risk %': '**Formula:** risk contribution of all systems in the cluster ÷ total portfolio risk.\n\n**Purpose:** identify concentration at the **group** level.\n\n**In plain English:** several different strategies can still be one trade wearing different hats.',
+    'Rolling Avg ρ': '**Formula:** average pairwise daily P&L correlation over a rolling window.\n\n**Purpose:** show whether diversification is stable or disappearing in recent market conditions.\n\n**In plain English:** are the strategies still minding their own business lately?',
+    'Regime-conditioned bootstrap': '**Method:** simulate a sequence of historical volatility regimes using their observed transition probabilities, then sample daily portfolio P&L from the corresponding regime.\n\n**Purpose:** account for the fact that markets tend to stay in similar volatility states for several days rather than behaving as completely independent observations.\n\n**In plain English:** if the portfolio is currently in a stormy period, the simulation gives stormy days a better chance of sticking around.\n\n- This is still a historical bootstrap, not a forecast of the next regime.',
+    'Current Vol Regime': '**Formula:** current portfolio realized volatility classified against the historical low/high percentile thresholds.\n\n**Purpose:** show the volatility state from which the regime-conditioned simulation starts.\n\n**In plain English:** what kind of market weather are we starting with?',
+    'Regime Persistence': '**Formula:** probability that the current volatility regime remains the same on the next simulated day.\n\n**Purpose:** quantify how sticky the regime is in the historical data.\n\n**In plain English:** once the weather turns rough, how often does it stay rough tomorrow?',
+    'P(loss)': '**Formula:** share of Monte Carlo simulations ending with negative portfolio P&L.\n\n**Purpose:** estimate downside frequency under the selected simulation assumptions.\n\n**In plain English:** how often does the simulated path finish in the red?',
+    'Median': '**Formula:** 50th percentile of simulated ending P&L.\n\n**Purpose:** show the middle Monte Carlo outcome.\n\n**In plain English:** if we ran the future 1,000 times, this is the outcome sitting right in the middle.',
+    'Mean': '**Formula:** average simulated ending P&L across all simulated paths.\n\n**Purpose:** show the arithmetic average outcome.\n\n**In plain English:** what the simulations make on average — remembering that a few extreme paths can move the average.',
+    '5th pct': '**Formula:** 5th percentile of simulated ending P&L.\n\n**Purpose:** represent a downside-tail scenario.\n\n**In plain English:** roughly 1 simulation out of 20 finishes worse than this.',
+    '95th': '**Formula:** 95th percentile of simulated ending P&L.\n\n**Purpose:** represent an upside-tail scenario.\n\n**In plain English:** roughly 1 simulation out of 20 finishes better than this.',
+    '5% Terminal ES': '**Formula:** average ending P&L of simulations in the worst 5% of outcomes.\n\n**Purpose:** measure the average severity of the bad tail, not just the cutoff.\n\n**In plain English:** if things land in the worst 5%, how bad is the average outcome?',
+    'Historical days': '**Formula:** number of valid historical daily P&L observations used by the simulation.\n\n**Purpose:** show how much historical evidence the Monte Carlo has available.\n\n**In plain English:** how many days of history are we asking the simulation to learn from?',
+}
+
+def metric_help(label):
+    return METRIC_HELP.get(label)
+
+def metric_with_help(container, label, value, delta=None, **kwargs):
+    help_text = kwargs.pop("help", None) or metric_help(label)
+    return container.metric(label, value, delta=delta, help=help_text, **kwargs)
+
+
+def _infer_table_formats(df: pd.DataFrame) -> dict:
+    """Infer readable formats safely. Never apply numeric formatters to text columns.
+
+    Formatting is presentation-only. A semantic name is not enough to make a
+    column numeric: e.g. ``System`` contains text, while some imported numeric
+    columns may have object dtype. We therefore require the column to be
+    genuinely numeric (or safely coercible to numeric) before assigning a
+    numeric formatter.
+    """
+    formats = {}
+    for col in df.columns:
+        series = df[col]
+
+        if pd.api.types.is_datetime64_any_dtype(series):
+            formats[col] = lambda v: "—" if pd.isna(v) else pd.Timestamp(v).strftime("%Y-%m-%d %H:%M")
+            continue
+
+        # Never infer numeric formatting from the column name alone.
+        # Text/object columns such as System, Market, Status, File, etc.
+        # must pass through untouched. For object columns containing numbers,
+        # allow formatting only when every non-null value is numeric.
+        if not pd.api.types.is_numeric_dtype(series):
+            non_null = series.dropna()
+            if non_null.empty:
+                continue
+            converted = pd.to_numeric(non_null, errors="coerce")
+            if converted.isna().any():
+                continue
+
+        name = str(col).strip().lower()
+        if any(k in name for k in ["commission", "fee"]):
+            formats[col] = _fmt_money2
+        elif any(k in name for k in ["p&l", "pnl", "profit", "drawdown", "daily vol", "vol /", "volatility", "risk", "impact", "delta", "cash", "capital", "equity"]):
+            formats[col] = _fmt_money
+        elif any(k in name for k in ["win %", "win rate", "weight", "probability", "p(loss)", "%"]):
+            formats[col] = _fmt_percent
+        elif "price" in name:
+            formats[col] = _fmt_price
+        elif any(k in name for k in ["trades", "contracts", "current n", "suggested n", "advisory n", "raw n", "qty", "quantity", "count"]):
+            formats[col] = _fmt_number
+        elif any(k in name for k in ["sharpe", "calmar", "profit factor", "pf", "corr", "correlation", "scale", "slippage", "ticks"]):
+            formats[col] = _fmt_decimal
+        # Unknown numeric columns are deliberately left alone rather than
+        # guessing a display precision. This prevents accidental formatting
+        # of identifiers and keeps the renderer safe for arbitrary tables.
+
+    return formats
+
+
+def render_table(data, **kwargs):
+    """Render raw DataFrames consistently; pass existing Styler objects through."""
+    if isinstance(data, pd.DataFrame):
+        return st.dataframe(data.style.format(_infer_table_formats(data), na_rep="—"), **kwargs)
+    return st.dataframe(data, **kwargs)
+
+
+def style_overview_table(df: pd.DataFrame):
+    styled = df.style.format({
+        "Net Profit": _fmt_money, "Max DD": _fmt_money,
+        "P&L Sharpe": _fmt_decimal, "Ann. P&L / Max DD": _fmt_decimal,
+        "PF": _fmt_decimal, "Win %": _fmt_percent, "# Trades": _fmt_number,
+    }, na_rep="—")
+
+    def pnl_colour(v):
+        if pd.isna(v): return ""
+        return "background-color: rgba(46, 125, 50, 0.10)" if v > 0 else ("background-color: rgba(198, 40, 40, 0.10)" if v < 0 else "")
+    def pf_colour(v):
+        if pd.isna(v): return ""
+        if v < 1.0: return "background-color: rgba(198, 40, 40, 0.14)"
+        if v < 1.3: return "background-color: rgba(245, 158, 11, 0.12)"
+        return "background-color: rgba(46, 125, 50, 0.12)"
+    def sharpe_colour(v):
+        if pd.isna(v): return ""
+        if v < 0: return "background-color: rgba(198, 40, 40, 0.14)"
+        if v < 1: return "background-color: rgba(245, 158, 11, 0.10)"
+        return "background-color: rgba(46, 125, 50, 0.12)"
+    if "Net Profit" in df.columns: styled = styled.map(pnl_colour, subset=["Net Profit"])
+    if "PF" in df.columns: styled = styled.map(pf_colour, subset=["PF"])
+    if "P&L Sharpe" in df.columns: styled = styled.map(sharpe_colour, subset=["P&L Sharpe"])
+    return styled
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -632,9 +860,12 @@ def build_net_equity(trades: pd.DataFrame, comm_per_trade: float,
 
 def compute_metrics(trades: pd.DataFrame, comm_per_trade: float,
                     scale: float = 1.0) -> dict:
-    """
-    Compute all performance metrics.
-    'scale' = current_n / default_n (1.0 = ReadMe default).
+    """Compute system performance metrics using daily net P&L.
+
+    P&L Sharpe is deliberately based on daily P&L rather than a return series,
+    because futures systems do not have a single meaningful invested-capital
+    denominator. The equity curve starts at zero so the first trading day's P&L
+    is included in Net Profit and the drawdown calculation.
     """
     if trades.empty:
         return {}
@@ -643,34 +874,38 @@ def compute_metrics(trades: pd.DataFrame, comm_per_trade: float,
     if eq_net.empty or len(eq_net) < 5:
         return {}
 
-    daily   = eq_net.diff().dropna()
+    # The first observation is already the first day's P&L. Use it directly
+    # rather than diff(), which would silently discard that first day.
+    daily = eq_net.diff().dropna()
+    first_day_pnl = eq_net.iloc[0]
+    daily_pnl = pd.concat([pd.Series([first_day_pnl], index=[eq_net.index[0]]), daily]).sort_index()
     run_max = eq_net.cummax()
-    max_dd  = (eq_net - run_max).min()
-    n_yr    = max((eq_net.index[-1] - eq_net.index[0]).days / 365.25, 0.01)
-    net     = eq_net.iloc[-1] - eq_net.iloc[0]
-    ann_r   = net / n_yr
-    ann_v   = daily.std() * np.sqrt(252)
-    sharpe  = ann_r / ann_v       if ann_v  > 0 else 0.0
-    calmar  = ann_r / abs(max_dd) if max_dd < 0 else 0.0
+    max_dd = (eq_net - run_max).min()
+    n_yr = max((eq_net.index[-1] - eq_net.index[0]).days / 365.25, 0.01)
+    net = float(eq_net.iloc[-1])
+    ann_pnl = net / n_yr
+    ann_vol = daily_pnl.std() * np.sqrt(252)
+    pnl_sharpe = (daily_pnl.mean() / daily_pnl.std() * np.sqrt(252)) if daily_pnl.std() > 0 else 0.0
+    ann_pnl_dd = ann_pnl / abs(max_dd) if max_dd < 0 else 0.0
 
     n_ct_t = trades["n_contracts"] if "n_contracts" in trades.columns else 1
     pnl_net_t = (trades["pnl"] - comm_per_trade * n_ct_t) * scale
-    wins_sum   = pnl_net_t[pnl_net_t > 0].sum()
-    loss_sum   = abs(pnl_net_t[pnl_net_t < 0].sum())
-    pf         = wins_sum / loss_sum if loss_sum > 0 else float("inf")
-    win_rate   = (pnl_net_t > 0).mean()
+    wins_sum = pnl_net_t[pnl_net_t > 0].sum()
+    loss_sum = abs(pnl_net_t[pnl_net_t < 0].sum())
+    pf = wins_sum / loss_sum if loss_sum > 0 else float("inf")
+    win_rate = (pnl_net_t > 0).mean()
 
     return {
-        "Net Profit ($)":   round(net, 0),
-        "Ann. Return ($)":  round(ann_r, 0),
-        "Max Drawdown ($)": round(max_dd, 0),
-        "Sharpe Ratio":     round(sharpe, 2),
-        "Calmar Ratio":     round(calmar, 2),
-        "Profit Factor":    round(pf, 2),
-        "Win Rate":         round(win_rate, 3),
-        "Ann. Volatility":  round(ann_v, 0),
-        "# Trades":         len(trades),
-        "Total Comm ($)":   round(float((n_ct_t * comm_per_trade).sum()) * scale, 0),
+        "Net Profit ($)":      round(net, 0),
+        "Ann. P&L ($)":        round(ann_pnl, 0),
+        "Max Drawdown ($)":    round(max_dd, 0),
+        "P&L Sharpe":          round(pnl_sharpe, 2),
+        "Ann. P&L / Max DD":   round(ann_pnl_dd, 2),
+        "Profit Factor":       round(pf, 2),
+        "Win Rate":            round(win_rate, 3),
+        "Ann. Volatility ($)": round(ann_vol, 0),
+        "# Trades":            len(trades),
+        "Total Comm ($)":      round(float((n_ct_t * comm_per_trade).sum()) * scale, 0),
     }
 
 
@@ -688,23 +923,26 @@ def get_net_equity_trimmed(si: dict, lookback_years: float,
 
 
 def compute_portfolio_metrics(port_eq: pd.Series) -> dict:
+    """Portfolio metrics using daily portfolio P&L and a zero-based equity curve."""
     if port_eq.empty or len(port_eq) < 5:
         return {}
-    daily  = port_eq.diff().dropna()
-    net    = port_eq.iloc[-1] - port_eq.iloc[0]
-    n_yr   = max((port_eq.index[-1] - port_eq.index[0]).days / 365.25, 0.01)
-    ann_r  = net / n_yr
-    ann_v  = daily.std() * np.sqrt(252)
-    sharpe = ann_r / ann_v if ann_v > 0 else 0.0
-    dd     = (port_eq - port_eq.cummax()).min()
-    calmar = ann_r / abs(dd) if dd < 0 else 0.0
+    daily = port_eq.diff().dropna()
+    first_day_pnl = port_eq.iloc[0]
+    daily_pnl = pd.concat([pd.Series([first_day_pnl], index=[port_eq.index[0]]), daily]).sort_index()
+    net = float(port_eq.iloc[-1])
+    n_yr = max((port_eq.index[-1] - port_eq.index[0]).days / 365.25, 0.01)
+    ann_pnl = net / n_yr
+    ann_vol = daily_pnl.std() * np.sqrt(252)
+    pnl_sharpe = (daily_pnl.mean() / daily_pnl.std() * np.sqrt(252)) if daily_pnl.std() > 0 else 0.0
+    dd = (port_eq - port_eq.cummax()).min()
+    ann_pnl_dd = ann_pnl / abs(dd) if dd < 0 else 0.0
     return {
-        "Net Profit ($)":   round(net, 0),
-        "Ann. Return ($)":  round(ann_r, 0),
-        "Max Drawdown ($)": round(dd, 0),
-        "Ann. Volatility":  round(ann_v, 0),
-        "Sharpe Ratio":     round(sharpe, 2),
-        "Calmar Ratio":     round(calmar, 2),
+        "Net Profit ($)":      round(net, 0),
+        "Ann. P&L ($)":        round(ann_pnl, 0),
+        "Max Drawdown ($)":    round(dd, 0),
+        "Ann. Volatility ($)": round(ann_vol, 0),
+        "P&L Sharpe":          round(pnl_sharpe, 2),
+        "Ann. P&L / Max DD":   round(ann_pnl_dd, 2),
     }
 
 
@@ -714,6 +952,57 @@ def combine_equity_curves(curves: dict, lookback_years: float) -> pd.DataFrame:
     df     = pd.concat(curves.values(), axis=1, keys=curves.keys()).sort_index().ffill()
     cutoff = df.index.max() - pd.Timedelta(days=int(lookback_years * 365))
     return df[df.index >= cutoff].ffill().fillna(0)
+
+
+def resolve_portfolio_date_range(min_date: pd.Timestamp,
+                                 max_date: pd.Timestamp,
+                                 preset: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    today = pd.Timestamp.today().normalize()
+    if preset == "MTD":
+        start = today.replace(day=1)
+        end = min(today, max_date)
+    elif preset == "YTD":
+        start = pd.Timestamp(today.year, 1, 1)
+        end = min(today, max_date)
+    elif preset == "Past week":
+        start = today - pd.Timedelta(days=7)
+        end = min(today, max_date)
+    elif preset == "Past 1 month":
+        start = today - pd.Timedelta(days=30)
+        end = min(today, max_date)
+    elif preset == "Past 3 months":
+        start = today - pd.Timedelta(days=90)
+        end = min(today, max_date)
+    elif preset == "Past 6 months":
+        start = today - pd.Timedelta(days=180)
+        end = min(today, max_date)
+    elif preset == "Past year":
+        start = today - pd.Timedelta(days=365)
+        end = min(today, max_date)
+    elif preset == "Past 2 years":
+        start = today - pd.Timedelta(days=730)
+        end = min(today, max_date)
+    elif preset == "2025":
+        start = pd.Timestamp("2025-01-01")
+        end = min(pd.Timestamp("2025-12-31"), max_date)
+    elif preset == "2024":
+        start = pd.Timestamp("2024-01-01")
+        end = min(pd.Timestamp("2024-12-31"), max_date)
+    else:
+        start, end = min_date, max_date
+
+    start = max(start, min_date)
+    end = min(end, max_date)
+    return start, end
+
+
+def filter_equity_by_date_range(eq_df: pd.DataFrame,
+                                start_date: pd.Timestamp,
+                                end_date: pd.Timestamp) -> pd.DataFrame:
+    if eq_df.empty:
+        return eq_df
+    dates = pd.date_range(start=start_date, end=end_date, freq="B")
+    return eq_df.reindex(dates).ffill().fillna(0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -763,6 +1052,109 @@ def health_traffic_light(sharpe: float, pf: float, win_rate: float) -> str:
 # PORTFOLIO HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _safe_date_range_state(key: str, min_date: pd.Timestamp, max_date: pd.Timestamp):
+    """Clamp persisted date-input state to the currently available data range."""
+    lo, hi = pd.Timestamp(min_date).date(), pd.Timestamp(max_date).date()
+    raw = st.session_state.get(key)
+    if not raw:
+        fixed = [lo, hi]
+    else:
+        vals = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        vals = vals[:2]
+        while len(vals) < 2:
+            vals.append(vals[-1] if vals else lo)
+        try:
+            d1, d2 = pd.Timestamp(vals[0]).date(), pd.Timestamp(vals[1]).date()
+        except Exception as exc:
+            st.warning(f"⚠️ Could not parse saved date range '{key}': {exc}. Resetting it.")
+            d1, d2 = lo, hi
+        d1, d2 = min(max(d1, lo), hi), min(max(d2, lo), hi)
+        if d1 > d2: d1, d2 = d2, d1
+        fixed = [d1, d2]
+    st.session_state[key] = fixed
+    return fixed
+
+def _effective_independent_bets(corr: pd.DataFrame) -> float:
+    if corr.empty or len(corr) < 2: return float(len(corr))
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool)).stack()
+    if upper.empty: return float(len(corr))
+    rho = float(upper.mean()); n = len(corr); denom = 1.0 + (n - 1) * rho
+    if denom <= 0: return float(n)
+    return float(np.clip(n / denom, 1.0, float(n)))
+
+def _resampled_corr(daily_pnl: pd.DataFrame, freq: str, min_periods: int = 12) -> pd.DataFrame:
+    if daily_pnl.empty: return pd.DataFrame()
+    if freq == "W": grouped = daily_pnl.resample("W-FRI").sum(min_count=1)
+    elif freq == "M": grouped = daily_pnl.resample("ME").sum(min_count=1)
+    else: return daily_pnl.corr(min_periods=min_periods)
+    return grouped.corr(min_periods=min_periods)
+
+def _build_periodic_trade_pnl(systems: dict, stems: list, lookback_years: float, sizing_map: dict, freq: str) -> pd.DataFrame:
+    """Weekly/monthly P&L from actual trade exits; no-trade periods remain NaN."""
+    series = {}
+    for stem in stems:
+        si = systems.get(stem)
+        if si is None or si.get("default_n", 0) <= 0 or si["trades"].empty: continue
+        t = si["trades"].copy()
+        ratio = float(sizing_map.get(stem, si["default_n"])) / float(si["default_n"])
+        t["exit_day"] = pd.to_datetime(t["exit_date"]).dt.normalize().apply(_snap_to_bday)
+        t["pnl_net"] = (pd.to_numeric(t["pnl"], errors="coerce") - float(si["comm_per_trade"]) * pd.to_numeric(t.get("n_contracts", 1), errors="coerce").fillna(1)) * ratio
+        t = t.dropna(subset=["exit_day", "pnl_net"])
+        if t.empty: continue
+        if freq == "W": g = t.groupby(pd.Grouper(key="exit_day", freq="W-FRI"))["pnl_net"].sum()
+        elif freq == "M": g = t.groupby(pd.Grouper(key="exit_day", freq="ME"))["pnl_net"].sum()
+        else: continue
+        cutoff = g.index.max() - pd.Timedelta(days=int(lookback_years*365))
+        series[stem] = g[g.index >= cutoff].rename(stem)
+    return pd.concat(series.values(), axis=1).sort_index() if series else pd.DataFrame()
+
+def portfolio_risk(systems: dict, stems: list, sizing_map: dict, lookback_years: float,
+                   window_days: int | None = None, date_start: pd.Timestamp | None = None,
+                   date_end: pd.Timestamp | None = None, min_overlap_days: int = 252) -> dict:
+    """Canonical portfolio risk: complete-case, constant-composition daily P&L."""
+    curves = {}
+    for stem in stems:
+        si = systems.get(stem)
+        if si is None or si.get("default_n", 0) <= 0: continue
+        cur_n = float(sizing_map.get(stem, si["default_n"]))
+        if cur_n <= 0: continue
+        eq = get_net_equity_trimmed(si, lookback_years, scale=cur_n / float(si["default_n"]))
+        if not eq.empty: curves[stem] = eq
+    if len(curves) < 2: return {}
+    daily = build_correlation_daily_pnl(curves, lookback_years).dropna(how="any")
+    if date_start is not None: daily = daily[daily.index >= pd.Timestamp(date_start)]
+    if date_end is not None: daily = daily[daily.index <= pd.Timestamp(date_end)]
+    if window_days is not None: daily = daily.tail(window_days)
+    if len(daily) < 20: return {"daily_pnl": daily}
+    port_daily = daily.sum(axis=1); daily_vol = float(port_daily.std())
+    cov_complete = daily.cov(); corr_complete = daily.corr(); vols = daily.std()
+    sum_vol = float(vols.sum()); div_ratio = sum_vol / daily_vol if daily_vol > 0 else np.nan
+    sigma = cov_complete.values; w = np.ones(len(cov_complete))
+    component = (sigma @ w) / daily_vol if daily_vol > 0 else np.zeros(len(w))
+    rc = pd.Series(component, index=cov_complete.index); rc_pct = rc / daily_vol if daily_vol > 0 else pd.Series(0.0, index=cov_complete.index)
+    pair_cov = daily.cov(min_periods=min_overlap_days); pair_corr = daily.corr(min_periods=min_overlap_days)
+    overlap = daily.notna().astype(int).T.dot(daily.notna().astype(int))
+    pair_psd = _nearest_psd(pair_cov) if not pair_cov.empty else pair_cov
+    raw_fill = pair_cov.fillna(0) if not pair_cov.empty else pair_cov
+    psd_norm = float(np.linalg.norm(pair_psd.values - raw_fill.values, ord="fro")) if not pair_cov.empty else 0.0
+    lw = LedoitWolf().fit(daily.values)
+    cov_shrunk = pd.DataFrame(lw.covariance_, index=daily.columns, columns=daily.columns)
+    
+    if not overlap.empty and len(overlap) > 1:
+        _ov = overlap.values.astype(float)
+        _mask = ~np.eye(len(overlap), dtype=bool)
+        min_pairwise = int(np.nanmin(_ov[_mask])) if np.isfinite(_ov[_mask]).any() else 0
+    else:
+        min_pairwise = 0
+    offdiag = pair_corr.where(np.triu(np.ones(pair_corr.shape), k=1).astype(bool)).stack()
+    return {"daily_pnl": daily, "portfolio_daily_vol": daily_vol, "portfolio_ann_vol": daily_vol*np.sqrt(252),
+            "vols": vols, "covariance": cov_complete, "covariance_pairwise": pair_cov, "covariance_shrunk": cov_shrunk,
+            "shrinkage_intensity": float(lw.shrinkage_), "corr": corr_complete, "corr_pairwise": pair_corr, "overlap": overlap,
+            "min_pairwise_overlap": min_pairwise, "psd_correction_frobenius": psd_norm, "sum_individual_vol": sum_vol,
+            "diversification_ratio": div_ratio, "avg_pairwise_corr": float(offdiag.mean()) if not offdiag.empty else np.nan,
+            "risk_contribution": rc, "risk_pct": rc_pct, "observations": len(daily), "start": daily.index.min(), "end": daily.index.max()}
+
+
 def build_portfolio_equity(systems: dict, stems: list,
                             lookback_years: float,
                             sizing_ratios: dict | None = None) -> pd.Series:
@@ -801,21 +1193,42 @@ def compute_risk_parity_sizing(systems: dict, stems: list, lookback_years: float
         if si is None or si["equity"].empty:
             sizing[stem] = 1
             continue
-        eq     = si["equity"]
+        eq     = get_net_equity_trimmed(si, lookback_years, scale=1.0)
         cutoff = eq.index.max() - pd.Timedelta(days=int(lookback_years * 365))
         eq_t   = eq[eq.index >= cutoff]
-        vol_1  = eq_t.diff().dropna().std()
-        if vol_1 <= 0 or np.isnan(vol_1):
-            sizing[stem] = si["default_n"]
-            detail[stem] = {"vol_1ct": 0, "raw_n": si["default_n"], "final_n": si["default_n"]}
+        # The stored equity curve is at the system's ReadMe/default sizing,
+        # so its daily volatility is NOT one-contract volatility. Convert it
+        # to a per-contract risk estimate before solving for N.
+        default_n = si["default_n"]
+        vol_default = eq_t.diff().dropna().std()
+        if vol_default <= 0 or np.isnan(vol_default) or default_n <= 0:
+            sizing[stem] = default_n if default_n > 0 else 1
+            detail[stem] = {
+                "vol_1ct": 0, "vol_default": float(vol_default) if np.isfinite(vol_default) else 0,
+                "raw_n": default_n, "final_n": sizing[stem]
+            }
             continue
-        raw_n   = target_daily_risk_usd / vol_1
+        vol_1ct = vol_default / default_n
+        raw_n   = target_daily_risk_usd / vol_1ct
         final_n = int(np.clip(round(raw_n), 0, max_contracts))
         sizing[stem] = final_n
-        detail[stem] = {"vol_1ct": round(float(vol_1), 2),
-                        "raw_n":   round(float(raw_n), 2),
-                        "final_n": final_n}
+        detail[stem] = {
+            "vol_1ct": round(float(vol_1ct), 2),
+            "vol_default": round(float(vol_default), 2),
+            "raw_n": round(float(raw_n), 2),
+            "final_n": final_n
+        }
     return sizing, detail
+
+
+def compute_recent_portfolio_daily_risk(systems: dict, stems: list, lookback_years: float,
+                                        sizing_ratios: dict, recent_days: int = 126,
+                                        date_start: pd.Timestamp | None = None, date_end: pd.Timestamp | None = None) -> tuple:
+    sizing_map = {stem: systems[stem]["default_n"] * sizing_ratios.get(stem, 1.0) for stem in stems if stem in systems}
+    r = portfolio_risk(systems, stems, sizing_map, lookback_years, window_days=recent_days, date_start=date_start, date_end=date_end)
+    d = r.get("daily_pnl", pd.DataFrame()) if r else pd.DataFrame()
+    if not r or "portfolio_daily_vol" not in r: return 0.0, len(d), d.index.min() if len(d) else None, d.index.max() if len(d) else None
+    return r["portfolio_daily_vol"], r["observations"], r["start"], r["end"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -851,7 +1264,8 @@ def decompose_drawdown(eq_df: pd.DataFrame, port_eq: pd.Series, top_n: int = 3) 
                 s_p = float(s.asof(pd_)) if pd_ >= s.index[0] else 0.0
                 s_t = float(s.asof(td))  if td  >= s.index[0] else 0.0
                 contribs[col] = s_t - s_p
-            except Exception:
+            except Exception as exc:
+                st.warning(f"⚠️ Drawdown contribution calculation failed for {col}: {exc}")
                 contribs[col] = 0.0
         total_loss = abs(ep["dd_abs"])
         ep["contributions"] = contribs
@@ -859,6 +1273,209 @@ def decompose_drawdown(eq_df: pd.DataFrame, port_eq: pd.Series, top_n: int = 3) 
                                for k, v in contribs.items()
                                if v < 0 and total_loss > 0}
     return episodes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORRELATION / CLUSTERING — v24 quantitative audit
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_correlation_daily_pnl(curves: dict, lookback_years: float,
+                                min_overlap_days: int = 63) -> pd.DataFrame:
+    """Build daily P&L series for correlation without inventing zero P&L.
+
+    Each system is allowed to have its own history. Missing observations remain
+    NaN, so pairwise correlation/covariance uses only dates where both systems
+    actually have data. This avoids treating a pre-launch strategy as if it
+    existed and made exactly $0 every day.
+    """
+    if not curves:
+        return pd.DataFrame()
+    daily = {}
+    max_date = max((s.index.max() for s in curves.values() if not s.empty),
+                   default=None)
+    if max_date is None:
+        return pd.DataFrame()
+    cutoff = max_date - pd.Timedelta(days=int(lookback_years * 365))
+    for stem, eq in curves.items():
+        if eq.empty:
+            continue
+        e = eq.sort_index()
+        e = e[e.index >= cutoff]
+        if len(e) < 2:
+            continue
+        d = e.diff()
+        d = d[d.index >= cutoff].rename(stem)
+        daily[stem] = d
+    if not daily:
+        return pd.DataFrame()
+    return pd.concat(daily.values(), axis=1).sort_index()
+
+
+def _pairwise_corr_cov(daily_pnl: pd.DataFrame, min_overlap_days: int = 63) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return pairwise correlation, covariance and observation-count matrices."""
+    if daily_pnl.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    corr = daily_pnl.corr(min_periods=min_overlap_days)
+    cov = daily_pnl.cov(min_periods=min_overlap_days)
+    counts = daily_pnl.notna().astype(int).T.dot(daily_pnl.notna().astype(int))
+    return corr, cov, counts
+
+
+def _nearest_psd(matrix: pd.DataFrame) -> pd.DataFrame:
+    """Project a symmetric covariance matrix to positive semi-definite form."""
+    if matrix.empty:
+        return matrix
+    a = matrix.astype(float).values
+    a = np.nan_to_num((a + a.T) / 2.0, nan=0.0, posinf=0.0, neginf=0.0)
+    diag = np.diag(matrix.astype(float).values)
+    for i, v in enumerate(diag):
+        if np.isfinite(v) and v > 0:
+            a[i, i] = v
+    vals, vecs = np.linalg.eigh(a)
+    vals = np.clip(vals, 1e-10, None)
+    psd = (vecs * vals) @ vecs.T
+    psd = (psd + psd.T) / 2.0
+    return pd.DataFrame(psd, index=matrix.index, columns=matrix.columns)
+
+
+def correlation_risk_stats(daily_pnl: pd.DataFrame, corr_mat: pd.DataFrame,
+                           cov_mat: pd.DataFrame) -> dict:
+    """Portfolio volatility and risk contributions at the current sizing."""
+    if daily_pnl.empty:
+        return {}
+    cols = [c for c in daily_pnl.columns if c in corr_mat.index and c in cov_mat.index]
+    if len(cols) < 2:
+        return {}
+    d = daily_pnl[cols]
+    vols = d.std().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    cov = cov_mat.loc[cols, cols].copy()
+    # Pairwise covariance can be non-PSD when histories differ. Missing
+    # cross-covariances are treated as zero for the risk calculation, then the
+    # matrix is projected to PSD so portfolio volatility is mathematically valid.
+    for c in cols:
+        if not np.isfinite(cov.loc[c, c]) or cov.loc[c, c] <= 0:
+            cov.loc[c, c] = vols[c] ** 2
+    cov = cov.fillna(0.0)
+    cov_psd = _nearest_psd(cov)
+    w = np.ones(len(cols))
+    sigma = cov_psd.values
+    port_var = float(w @ sigma @ w)
+    port_vol = float(np.sqrt(max(port_var, 0.0)))
+    marginal = (sigma @ w) / port_vol if port_vol > 0 else np.zeros(len(cols))
+    component = w * marginal
+    rc_pct = component / port_vol if port_vol > 0 else np.zeros(len(cols))
+    sum_vol = float(vols.sum())
+    div_ratio = sum_vol / port_vol if port_vol > 0 else np.nan
+    return {
+        "vols": vols,
+        "cov_psd": cov_psd,
+        "portfolio_vol": port_vol,
+        "sum_individual_vol": sum_vol,
+        "diversification_ratio": div_ratio,
+        "marginal": pd.Series(marginal, index=cols),
+        "component": pd.Series(component, index=cols),
+        "rc_pct": pd.Series(rc_pct, index=cols),
+    }
+
+
+def compute_correlation_aware_rp(unit_daily_pnl: pd.DataFrame, account_balance: float,
+                                 target_annual_risk_pct: float, max_contracts: int = 20) -> dict:
+    """Solve equal-risk-contribution sizing using unit-contract covariance."""
+    if unit_daily_pnl.empty or unit_daily_pnl.shape[1] < 2:
+        return {}
+    cols = unit_daily_pnl.columns.tolist()
+    complete = unit_daily_pnl[cols].dropna(how="any")
+    if len(complete) < 252:
+        return {}
+    vols = complete.std().reindex(cols).fillna(0.0)
+    lw = LedoitWolf().fit(complete.values)
+    cov = pd.DataFrame(lw.covariance_, index=cols, columns=cols)
+    S = cov.values
+    n = len(cols)
+
+    def rc_pct(w):
+        pv = float(w @ S @ w)
+        if pv <= 0:
+            return np.zeros(n)
+        return w * (S @ w) / pv
+
+    target_rc = 1.0 / n
+    def objective(w):
+        pct = rc_pct(w)
+        penalty = np.sum(np.minimum(pct, 0.0) ** 2) * 100.0
+        return float(np.sum((pct - target_rc) ** 2) + penalty)
+
+    x0 = np.repeat(1.0 / n, n)
+    res = minimize(objective, x0, method="SLSQP", bounds=[(1e-7, 1.0)] * n,
+                   constraints=[{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}],
+                   options={"maxiter": 2000, "ftol": 1e-12})
+    weights = np.asarray(res.x if res.success else x0, dtype=float)
+    weights = np.clip(weights, 1e-9, None); weights /= weights.sum()
+    target_daily = max(float(account_balance) * float(target_annual_risk_pct) / 100.0 / np.sqrt(252), 0.0)
+    base_vol = float(np.sqrt(max(weights @ S @ weights, 0.0)))
+    continuous = weights * (target_daily / base_vol if base_vol > 0 else 0.0)
+    integer = np.clip(np.rint(continuous).astype(int), 0, max_contracts)
+    if target_daily > 0 and integer.sum() == 0:
+        integer[np.argmax(continuous)] = 1
+
+    def stats(q):
+        pv = float(q @ S @ q); sig = np.sqrt(max(pv, 0.0))
+        comp = q * (S @ q) / sig if sig > 0 else np.zeros(n)
+        return sig, comp, comp / sig if sig > 0 else np.zeros(n)
+    def score(q):
+        sig, _, pct = stats(q)
+        if sig <= 0: return 1e9
+        active = q > 0; desired = 1.0 / active.sum()
+        return float(np.sum((pct[active] - desired) ** 2) + 0.05 * ((sig - target_daily) / max(target_daily, 1.0)) ** 2)
+    current = integer.copy()
+    for _ in range(6 * n):
+        best, best_score = current.copy(), score(current)
+        for i in range(n):
+            for delta in (-1, 1):
+                cand = current.copy(); cand[i] = int(np.clip(cand[i] + delta, 0, max_contracts))
+                sc = score(cand)
+                if sc < best_score - 1e-12: best, best_score = cand, sc
+        if np.array_equal(best, current): break
+        current = best
+    final_vol, final_comp, final_pct = stats(current)
+    return {"cov": cov, "unit_vol": vols, "continuous": pd.Series(continuous, index=cols),
+            "integer": pd.Series(current, index=cols, dtype=int), "target_daily": target_daily,
+            "portfolio_vol": final_vol, "risk_contribution": pd.Series(final_comp, index=cols),
+            "risk_pct": pd.Series(final_pct, index=cols), "continuous_success": bool(res.success), "shrinkage_intensity": float(lw.shrinkage_), "observations": len(complete), "min_overlap_days": len(complete)}
+
+
+def extract_correlation_clusters(corr_mat: pd.DataFrame, threshold: float = 0.70) -> dict:
+    """Group systems using average-linkage correlation distance.
+
+    Missing pairwise correlations are not treated as zero correlation. Systems
+    without a complete correlation row become singleton clusters.
+    """
+    if corr_mat.empty:
+        return {}
+    clean = corr_mat.copy().clip(-1, 1)
+    clean = clean.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    if len(clean) < 2:
+        return {c: i + 1 for i, c in enumerate(clean.columns)}
+    complete = clean.dropna(axis=0, how="any").dropna(axis=1, how="any")
+    labels_out = {}
+    next_label = 1
+    if len(complete) >= 2:
+        vals = complete.values.astype(float)
+        vals = (vals + vals.T) / 2.0
+        np.fill_diagonal(vals, 1.0)
+        dist = np.clip(1.0 - vals, 0.0, 2.0)
+        try:
+            z = linkage(squareform(dist, checks=False), method="average")
+            labels = fcluster(z, t=max(0.05, 1 - threshold), criterion="distance")
+            labels_out.update(dict(zip(complete.columns, labels)))
+            next_label = max(labels_out.values(), default=0) + 1
+        except Exception as exc:
+            st.warning(f"⚠️ Correlation clustering failed; affected systems will be singletons: {exc}")
+    for c in clean.columns:
+        if c not in labels_out:
+            labels_out[c] = next_label
+            next_label += 1
+    return labels_out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -880,19 +1497,12 @@ def cluster_correlation_matrix(corr_matrix: pd.DataFrame) -> tuple:
     try:
         from scipy.spatial.distance import squareform as sf
         dist_condensed = sf(dist, checks=False)
-        order = leaves_list(linkage(dist_condensed, method="ward"))
-    except Exception:
+        order = leaves_list(linkage(dist_condensed, method="average"))
+    except Exception as exc:
+        st.warning(f"⚠️ Correlation heatmap ordering failed; using original order: {exc}")
         order = list(range(n))
     cols = corr_matrix.columns[order]
     return corr_matrix.loc[cols, cols], order
-
-
-def compute_cluster_risk_score(corr_matrix: pd.DataFrame) -> float:
-    if corr_matrix.empty or len(corr_matrix) < 2:
-        return 0.0
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    vals  = upper.stack()
-    return float(np.clip((vals.mean() + 1) / 2 * 100, 0, 100)) if not vals.empty else 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -945,34 +1555,165 @@ def recommend_portfolios(eq_df: pd.DataFrame, systems: dict) -> list:
 
 def monte_carlo_simulation(systems: dict, stems: list, lookback_years: float,
                             n_sims: int = 1000, forward_days: int = 126,
-                            sizing_ratios: dict | None = None) -> dict | None:
-    daily_list = []
+                            sizing_ratios: dict | None = None,
+                            method: str = "Regime-conditioned bootstrap",
+                            block_days: int = 5,
+                            regime_window: int = 20,
+                            low_pct: int = 33, high_pct: int = 66,
+                            account_balance: float = 130000,
+                            seed: int = 42) -> dict | None:
+    """Monte Carlo of historical daily portfolio P&L.
+
+    The simulation operates on the already-combined portfolio daily P&L, so
+    cross-system correlation is preserved in every historical observation.
+    IID bootstrap resamples individual days. Block bootstrap resamples short
+    consecutive blocks, preserving some serial dependence (runs of wins/losses
+    and volatility clustering). Regime-conditioned bootstrap first classifies
+    historical portfolio volatility into Low/Medium/High states, estimates
+    state-to-state transition probabilities, then samples daily P&L from the
+    simulated state. This captures regime persistence without pretending we
+    know the future regime.
+    """
+    curves = {}
     for stem in stems:
-        si    = systems.get(stem)
+        si = systems.get(stem)
         if si is None or si["trades"].empty:
             continue
         ratio = (sizing_ratios or {}).get(stem, 1.0)
-        eq    = get_net_equity_trimmed(si, lookback_years, scale=ratio)
+        eq = get_net_equity_trimmed(si, lookback_years, scale=ratio)
         if not eq.empty:
-            daily_list.append(eq.diff().dropna())
-    if not daily_list:
+            curves[stem] = eq
+    if not curves:
         return None
-    pool = pd.concat(daily_list, axis=1).fillna(0).sum(axis=1).values
+
+    # Only use the period where the portfolio has valid observations.
+    # Missing dates are not silently converted to zero before the first
+    # observation of a system.
+    df = pd.concat(curves.values(), axis=1, keys=curves.keys()).sort_index().ffill()
+    daily = df.diff().dropna(how="all")
+    # Do not mix early periods with fewer live systems into the forward pool.
+    daily = daily.dropna(how="any")
+    if daily.empty:
+        return None
+    pool = daily.sum(axis=1).dropna().values.astype(float)
     if len(pool) < 20:
         return None
-    rng   = np.random.default_rng(42)
-    paths = np.zeros((forward_days, n_sims))
-    for sim in range(n_sims):
-        paths[:, sim] = np.cumsum(rng.choice(pool, size=forward_days, replace=True))
+
+    rng = np.random.default_rng(seed)
+    paths = np.zeros((forward_days + 1, n_sims), dtype=float)
+
+    regime_info = {}
+    if method == "IID bootstrap" or (block_days <= 1 and method == "Block bootstrap"):
+        draws = rng.integers(0, len(pool), size=(forward_days, n_sims))
+        sampled = pool[draws]
+    elif method == "Block bootstrap":
+        # Moving-block bootstrap. Start positions are random; blocks may wrap
+        # around the historical sample so every path reaches the horizon.
+        n_blocks = int(np.ceil(forward_days / block_days))
+        starts = rng.integers(0, len(pool), size=(n_blocks, n_sims))
+        offsets = np.arange(block_days)[:, None]
+        pieces = []
+        for j in range(n_blocks):
+            idx = (starts[j][None, :] + offsets) % len(pool)
+            pieces.append(pool[idx])
+        sampled = np.concatenate(pieces, axis=0)[:forward_days, :]
+    else:
+        # Regime-conditioned bootstrap: classify historical portfolio daily P&L
+        # by rolling realized volatility, estimate an empirical Markov transition
+        # matrix, and draw P&L from the regime selected for each simulated day.
+        # The simulated path starts in the regime observed at the end of history.
+        s = pd.Series(pool, index=daily.index[-len(pool):])
+        roll_vol = s.rolling(regime_window).std() * np.sqrt(252)
+        valid = roll_vol.dropna()
+        if len(valid) < max(60, regime_window * 3):
+            return None
+        lo = float(np.percentile(valid.values, low_pct))
+        hi = float(np.percentile(valid.values, high_pct))
+        labels = pd.Series(index=s.index, dtype="object")
+        labels.loc[roll_vol <= lo] = "Low Vol"
+        labels.loc[(roll_vol > lo) & (roll_vol < hi)] = "Medium Vol"
+        labels.loc[roll_vol >= hi] = "High Vol"
+        labels = labels.dropna()
+        aligned = s.reindex(labels.index).dropna()
+        labels = labels.reindex(aligned.index).dropna()
+        states = ["Low Vol", "Medium Vol", "High Vol"]
+        pools = {state_name: aligned[labels == state_name].values.astype(float) for state_name in states}
+        if any(len(v) < 10 for v in pools.values()):
+            return None
+
+        trans = pd.DataFrame(0.0, index=states, columns=states)
+        counts = pd.Series(0.0, index=states)
+        arr = labels.values
+        for i in range(len(arr) - 1):
+            a, b = arr[i], arr[i + 1]
+            if a in states and b in states:
+                trans.loc[a, b] += 1
+                counts.loc[a] += 1
+        for state_name in states:
+            if counts.loc[state_name] > 0:
+                trans.loc[state_name] /= counts.loc[state_name]
+            else:
+                trans.loc[state_name, state_name] = 1.0
+
+        current_state = labels.iloc[-1]
+        sampled = np.empty((forward_days, n_sims), dtype=float)
+        state_arr = np.empty((forward_days, n_sims), dtype=object)
+        prev_states = np.full(n_sims, current_state, dtype=object)
+        for d in range(forward_days):
+            for j in range(n_sims):
+                probs = trans.loc[prev_states[j]].values
+                next_state = rng.choice(states, p=probs / probs.sum())
+                state_arr[d, j] = next_state
+                sampled[d, j] = rng.choice(pools[next_state])
+            prev_states = state_arr[d, :].copy()
+
+        persist = float(trans.loc[current_state, current_state])
+        regime_info = {
+            "current_regime": current_state,
+            "regime_low_threshold": lo,
+            "regime_high_threshold": hi,
+            "regime_persistence": persist,
+            "regime_transition": trans,
+        }
+
+    paths[1:, :] = np.cumsum(sampled, axis=0)
+
     pctiles = pd.DataFrame({
-        k: np.percentile(paths, p, axis=1)
-        for k, p in [("5th", 5), ("25th", 25), ("50th", 50), ("75th", 75), ("95th", 95)]
+        k: np.percentile(paths[1:, :], p, axis=1)
+        for k, p in [("5th", 5), ("25th", 25), ("50th", 50),
+                     ("75th", 75), ("95th", 95)]
     })
-    peak  = np.maximum.accumulate(paths, axis=0)
-    dd_probs = {t: ((paths - peak).min(axis=0) < -t).mean()
-                for t in [5000, 10000, 15000, 20000, 30000, 50000]}
-    return {"paths": pd.DataFrame(paths), "percentiles": pctiles,
-            "dd_probs": dd_probs, "n_sims": n_sims, "forward_days": forward_days}
+
+    final = paths[-1, :]
+    peak = np.maximum.accumulate(paths, axis=0)
+    drawdowns = paths - peak
+    max_dd = drawdowns.min(axis=0)
+
+    # Use meaningful, account-scaled thresholds rather than hard-coded
+    # dollar values. They are expressed as fractions of account equity.
+    account_balance = float(account_balance)
+    dd_thresholds = [0.025, 0.05, 0.10, 0.15, 0.20, 0.25]
+    dd_probs = {t: float((max_dd < -(account_balance * t)).mean())
+                for t in dd_thresholds}
+
+    terminal_var_5 = float(np.percentile(final, 5))
+    tail = final[final <= terminal_var_5]
+    terminal_es_5 = float(tail.mean()) if len(tail) else terminal_var_5
+
+    return {
+        "paths": pd.DataFrame(paths[1:]),
+        "percentiles": pctiles,
+        "dd_probs": dd_probs,
+        "max_dd": max_dd,
+        "terminal_var_5": terminal_var_5,
+        "terminal_es_5": terminal_es_5,
+        "n_sims": n_sims,
+        "forward_days": forward_days,
+        "method": method,
+        "block_days": block_days,
+        "historical_days": len(pool),
+        **regime_info,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1095,7 +1836,7 @@ def build_excel_export(systems: dict, lookback_years: float,
     # Summary sheet
     hdr1  = ["System", "Contract Label", "Default N", "Current N", "Scale",
              "Source", "# Trades", "Net Profit ($)", "Max DD ($)",
-             "Sharpe", "Calmar", "PF", "Win Rate", "B5 Match"]
+             "P&L Sharpe", "Ann. P&L / Max DD", "PF", "Win Rate", "B5 Match"]
     rows1 = []
     for stem, si in systems.items():
         ratio = ratios.get(stem, 1.0)
@@ -1107,7 +1848,7 @@ def build_excel_export(systems: dict, lookback_years: float,
             "📊 trades" if si["data_source"] == "trades" else "⚠️ fallback",
             m.get("# Trades", 0),
             m.get("Net Profit ($)", ""),    m.get("Max Drawdown ($)", ""),
-            m.get("Sharpe Ratio", ""),      m.get("Calmar Ratio", ""),
+            m.get("P&L Sharpe", ""),        m.get("Ann. P&L / Max DD", ""),
             m.get("Profit Factor", ""),
             f'{m.get("Win Rate", 0):.1%}' if m else "",
             "✅" if si["b5_match"] else "❌",
@@ -1181,6 +1922,9 @@ def plot_equity(eq: pd.Series, name: str, color: str = "#268bd2") -> go.Figure:
     fig.add_trace(go.Scatter(x=eq.index, y=run_max.values, name="Peak",
                              line=dict(color=C["peak"], width=1, dash="dot"),
                              showlegend=False), row=1, col=1)
+    fig.add_shape(type="line", x0=eq.index.min(), x1=eq.index.max(),
+                  y0=0, y1=0, line=dict(color=C["zero_line"], width=1, dash="dash"),
+                  xref="x", yref="y", row=1, col=1)
     fig.add_trace(go.Scatter(x=eq.index, y=dd.values, name="DD",
                              fill="tozeroy", line=dict(color=C["dd_line"], width=1),
                              fillcolor=C["drawdown"],
@@ -1207,16 +1951,17 @@ def plot_portfolio_equity(port_eq: pd.Series, eq_df: pd.DataFrame,
             line=dict(width=0.5), fillcolor=fill_c,
             hovertemplate=f"{lbl[:25]}<br>%{{x|%Y-%m-%d}}<br>$%{{y:,.0f}}<extra></extra>"),
             row=1, col=1)
-    fig.add_trace(go.Scatter(x=port_eq.index, y=port_eq.values,
-                             name="Portfolio Total",
-                             line=dict(color=C["portfolio"], width=2.5)),
-                  row=1, col=1)
-    dd = port_eq - port_eq.cummax()
-    fig.add_trace(go.Scatter(x=port_eq.index, y=dd.values, name="DD",
-                             fill="tozeroy", line=dict(color=C["dd_line"], width=1),
-                             fillcolor=C["drawdown"]), row=2, col=1)
-    fig.update_layout(template=THEME, height=580,
+
+    fig.add_trace(go.Scatter(
+        x=eq_df.index, y=[0] * len(eq_df),
+        mode="lines", name="Zero", showlegend=False,
+        line=dict(color=C["zero_line"], width=1, dash="dash")),
+        row=1, col=1)
+    fig.update_yaxes(zeroline=True, zerolinewidth=1,
+                     zerolinecolor=C["zero_line"], row=1, col=1)
+    fig.update_layout(template=THEME, height=560,
                       margin=dict(l=0, r=0, t=10, b=0),
+                      legend=dict(orientation="h", y=1.05),
                       yaxis_title="Cum. P&L ($)", yaxis2_title="Drawdown ($)")
     return fig
 
@@ -1347,7 +2092,7 @@ def plot_clustered_correlation(corr_matrix: pd.DataFrame, systems: dict,
         zmid=0, zmin=-1, zmax=1, colorbar=dict(title="ρ")))
     fig.update_layout(template=THEME, height=680,
                       margin=dict(l=0, r=0, t=50, b=0),
-                      title=f"Clustered Correlation (Ward) — 🔴 ρ > {over_thresh}",
+                      title=f"Clustered Correlation (Average linkage; monthly primary) — 🔴 ρ > {over_thresh}",
                       xaxis_tickangle=-45, shapes=shapes)
     return fig
 
@@ -1356,7 +2101,7 @@ def plot_clustered_correlation(corr_matrix: pd.DataFrame, systems: dict,
 # PAGE CONFIG & CSS
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Quant Dashboard v11", page_icon="📈",
+st.set_page_config(page_title=f"Quant Dashboard {APP_VERSION}", page_icon="📈",
                    layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
@@ -1388,6 +2133,20 @@ with st.sidebar:
     st.title("⚙️ Settings")
     data_dir_input = st.text_input("Data directory", value=str(DATA_DIR))
     lookback       = st.slider("Lookback (years)", 1, 10, 10)
+    account_balance = st.number_input(
+        "Portfolio account balance ($)",
+        min_value=1_000.0, max_value=10_000_000.0,
+        value=130_000.0, step=5_000.0, format="%0.0f",
+        help=("Capital you want the dashboard to use as the reference equity. "
+              "This is an input for risk/leverage context, not historical P&L."))
+    st.caption("Used for risk/equity and sizing context — not for calculating historical P&L.")
+    constant_composition = st.checkbox("Constant composition for portfolio analytics", value=True, key="constant_composition_v251", help="When on, portfolio performance and sizing diagnostics use the same system set throughout the analysed window.")
+    target_annual_risk = st.number_input(
+        "Target annualized portfolio risk (%)",
+        min_value=5.0, max_value=100.0, value=25.0, step=1.0,
+        format="%0.0f",
+        help=("Reference target for portfolio risk. It is not a forecast and not a margin requirement. "
+              "In plain English: how much annualized P&L turbulence are you willing to tolerate relative to the account?"))
     st.divider()
     st.caption("**Commission rates ($/contract, round-trip)**")
     st.write("Edit per-contract round-trip commission rates below. These are applied as `rate * n_contracts` for each trade.")
@@ -1405,7 +2164,7 @@ with st.sidebar:
                                  max_value=5000.0, step=50.0)
     rp_max_ct = st.slider("Max contracts (RP)", 1, 30, 20)
     st.divider()
-    st.caption("v11.0 — ReadMe names · Dynamic sizing · Raw-trade P&L")
+    st.caption(f"{APP_VERSION} — Correlation audit · Risk-aware portfolio sizing · Dynamic sizing · Raw-trade P&L")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1419,7 +2178,7 @@ with st.spinner("Loading trading systems from raw trades…"):
         _version=_LOAD_VERSION)
 
 if not systems:
-    st.error("No .xlsx files found.")
+    st.error("No trading-system files (.xlsx or .csv) could be loaded from the selected data directory.")
     st.stop()
 
 for w in load_warnings:
@@ -1427,11 +2186,9 @@ for w in load_warnings:
 
 n_sys        = len(systems)
 total_trades = sum(len(si["trades"]) for si in systems.values())
+n_active_readme = sum(1 for si in systems.values() if si["default_n"] > 0 and not si["trades"].empty)
 
-st.title(f"📊 Quant Portfolio Dashboard v11  —  {n_sys} systems · {total_trades:,} trades")
-
-_active_stems = [s for s in systems
-                 if not systems[s]["trades"].empty and not systems[s]["equity"].empty]
+st.title(f"📊 Quant Portfolio Dashboard {APP_VERSION}  —  {n_sys} files · {n_active_readme} active · {total_trades:,} trades")
 
 # ── Initialise session_state sizing dict on first load ─────────────────────
 if "sizing" not in st.session_state:
@@ -1442,6 +2199,15 @@ if "sizing" not in st.session_state:
 for stem in systems:
     if stem not in st.session_state["sizing"]:
         st.session_state["sizing"][stem] = systems[stem]["default_n"]
+
+# Only explicitly active, matched systems enter portfolio risk and sizing.
+_active_stems = [
+    stem for stem in systems
+    if not systems[stem]["trades"].empty
+    and not systems[stem]["equity"].empty
+    and systems[stem]["default_n"] > 0
+    and st.session_state["sizing"].get(stem, systems[stem]["default_n"]) > 0
+]
 
 
 def _cur_ratio(stem: str) -> float:
@@ -1469,8 +2235,8 @@ with st.sidebar:
         if not eq.empty:
             _export_eq[stem] = eq
     if len(_export_eq) >= 2:
-        _corr_df_exp = combine_equity_curves(_export_eq, lookback)
-        _export_corr = _corr_df_exp.diff().dropna().corr()
+        _export_daily_corr = build_correlation_daily_pnl(_export_eq, lookback)
+        _export_corr, _, _ = _pairwise_corr_cov(_export_daily_corr, min_overlap_days=63)
 
     if st.button("📥 Generate Excel Report", use_container_width=True):
         with st.spinner("Building workbook…"):
@@ -1480,7 +2246,7 @@ with st.sidebar:
                                       corr_matrix=_export_corr)
         st.download_button(
             "⬇️ Download Excel", data=xls,
-            file_name=f"quant_v11_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            file_name=f"quant_{APP_VERSION}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True)
 
@@ -1507,6 +2273,10 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     # ── SIZING PANEL ─────────────────────────────────────────────────────────
     st.subheader("⚖️ Position Sizing Editor")
+    active_readme = sum(1 for si in systems.values() if si["default_n"] > 0)
+    inactive_readme = sum(1 for si in systems.values() if si["default_n"] == 0)
+    market_count = len({si["symbol"] for si in systems.values()})
+    st.caption(f"{active_readme} active ReadMe allocations · {inactive_readme} zero-size/inactive · {market_count} markets")
     st.caption(
         "Adjust contract counts below. Metrics and equity curves rescale live as "
         "**P&L × (current / default)**. Default values come from ReadMe.txt. "
@@ -1553,36 +2323,114 @@ with tab1:
     # ── OVERVIEW TABLE ───────────────────────────────────────────────────────
     st.subheader("System Overview")
     st.caption(
-        "**Src:** 📊 = metrics from raw Trades List (correct).  "
-        "⚠️ = system absent from ReadMe.txt (filename used).  "
-        "All P&L values are TradeStation full-position dollars, scaled by "
-        "current sizing ratio.")
+        "P&L is TradeStation full-position dollars scaled to current sizing. "
+        "Values are rounded only for display; calculations retain full precision. "
+        "Use the Data quality & validation section below to inspect source/coverage issues.")
+
+    overview_dates = [si["trades"]["exit_date"] for si in systems.values() if not si["trades"].empty]
+    if overview_dates:
+        ov_min = min(series.min() for series in overview_dates)
+        ov_max = max(series.max() for series in overview_dates)
+    else:
+        ov_min = pd.Timestamp.today()
+        ov_max = pd.Timestamp.today()
+
+    ov_presets = [
+        "All history", "Past week", "Past 1 month", "Past 3 months", "Past 6 months",
+        "Past year", "Past 2 years", "MTD", "YTD", "2025", "2024", "Custom"]
+    if "ov_date_preset" not in st.session_state or st.session_state["ov_date_preset"] not in ov_presets:
+        st.session_state["ov_date_preset"] = "All history"
+    if "ov_custom_range" not in st.session_state:
+        st.session_state["ov_custom_range"] = [ov_min.date(), ov_max.date()]
+
+    with st.expander("Date filter", expanded=True):
+        btn1 = st.columns(6)
+        if btn1[0].button("All history", key="ov_all"):
+            st.session_state["ov_date_preset"] = "All history"
+        if btn1[1].button("Past week", key="ov_week"):
+            st.session_state["ov_date_preset"] = "Past week"
+        if btn1[2].button("Past 1 month", key="ov_1m"):
+            st.session_state["ov_date_preset"] = "Past 1 month"
+        if btn1[3].button("Past 3 months", key="ov_3m"):
+            st.session_state["ov_date_preset"] = "Past 3 months"
+        if btn1[4].button("Past 6 months", key="ov_6m"):
+            st.session_state["ov_date_preset"] = "Past 6 months"
+        if btn1[5].button("Past year", key="ov_1y"):
+            st.session_state["ov_date_preset"] = "Past year"
+
+        btn2 = st.columns(6)
+        if btn2[0].button("Past 2 years", key="ov_2y"):
+            st.session_state["ov_date_preset"] = "Past 2 years"
+        if btn2[1].button("MTD", key="ov_mtd"):
+            st.session_state["ov_date_preset"] = "MTD"
+        if btn2[2].button("YTD", key="ov_ytd"):
+            st.session_state["ov_date_preset"] = "YTD"
+        if btn2[3].button("2025", key="ov_2025"):
+            st.session_state["ov_date_preset"] = "2025"
+        if btn2[4].button("2024", key="ov_2024"):
+            st.session_state["ov_date_preset"] = "2024"
+        if btn2[5].button("Custom", key="ov_custom"):
+            st.session_state["ov_date_preset"] = "Custom"
+
+        ov_custom_range = st.date_input(
+            "Custom range",
+            value=st.session_state["ov_custom_range"],
+            min_value=ov_min.date(),
+            max_value=ov_max.date(),
+            key="ov_custom_range")
+
+        st.caption(f"Active filter: {st.session_state['ov_date_preset']}")
+
+    ov_preset = st.session_state["ov_date_preset"]
+    if ov_preset == "Custom":
+        if isinstance(ov_custom_range, tuple):
+            ov_start = pd.Timestamp(ov_custom_range[0])
+            ov_end = pd.Timestamp(ov_custom_range[1])
+        else:
+            ov_start = pd.Timestamp(ov_custom_range)
+            ov_end = pd.Timestamp(ov_custom_range)
+    else:
+        ov_start, ov_end = resolve_portfolio_date_range(ov_min, ov_max, ov_preset)
+
+    ov_caption = f"Showing {ov_start:%Y-%m-%d} → {ov_end:%Y-%m-%d}  |  Active filter: {ov_preset}"
+    st.caption(ov_caption)
 
     ov_rows = []
     for stem, si in systems.items():
         ratio     = _cur_ratio(stem)
         cur_n     = st.session_state["sizing"].get(stem, si["default_n"])
-        src_badge = "📊" if si["data_source"] == "trades" else "⚠️"
         inactive  = " ⏸" if si["is_inactive"] else ""
-        m         = compute_metrics(si["trades"], si["comm_per_trade"], ratio)
+        trades    = si["trades"]
+        if not trades.empty:
+            trades = trades[(trades["exit_date"] >= ov_start) &
+                            (trades["exit_date"] <= ov_end)].copy()
+        m         = compute_metrics(trades, si["comm_per_trade"], ratio)
+        # Source/validation details belong in the expandable data-quality section,
+        # not in the main overview table.
+        _ = inactive  # retained for readability of the sizing logic above
         ov_rows.append({
-            "Src":        src_badge + inactive,
             "System":     si["display_name"],
-            "Sym":        si["symbol"],
-            "Contracts":  f"{cur_n} {si['contract_type']}  (def {si['default_n']})",
-            "# Trades":   m.get("# Trades", len(si["trades"])),
-            "Net Profit": f'${m.get("Net Profit ($)", 0):,.0f}' if m else "—",
-            "Max DD":     f'${m.get("Max Drawdown ($)", 0):,.0f}' if m else "—",
-            "Sharpe":     m.get("Sharpe Ratio", "—"),
-            "Calmar":     m.get("Calmar Ratio", "—"),
-            "PF":         m.get("Profit Factor", "—"),
-            "Win %":      f'{m.get("Win Rate", 0):.1%}' if m else "—",
-            "B5✓":        ("✅" if si["b5_match"]
-                           else ("—" if b5_is_none(si) else "❌")),
+            "Market":     si["symbol"],
+            "Position":   f"{cur_n} {si['contract_type']}" + (f"  (def {si['default_n']})" if cur_n != si["default_n"] else ""),
+            "# Trades":   m.get("# Trades", len(trades) if not trades.empty else 0),
+            "Net Profit": m.get("Net Profit ($)", np.nan) if m else np.nan,
+            "Max DD":     m.get("Max Drawdown ($)", np.nan) if m else np.nan,
+            "P&L Sharpe": m.get("P&L Sharpe", np.nan) if m else np.nan,
+            "Ann. P&L / DD": m.get("Ann. P&L / Max DD", np.nan) if m else np.nan,
+            "PF":         m.get("Profit Factor", np.nan) if m else np.nan,
+            "Win %":      m.get("Win Rate", np.nan) if m else np.nan,
         })
 
-    st.dataframe(pd.DataFrame(ov_rows), use_container_width=True,
-                 height=min(42 + 36 * n_sys, 700), hide_index=True)
+    ov_df = pd.DataFrame(ov_rows)
+    # ensure numeric columns keep numeric dtype for sorting, then style for display
+    for c in ["Net Profit", "Max DD", "Sharpe", "Calmar", "PF", "Win %", "# Trades"]:
+        if c in ov_df.columns:
+            ov_df[c] = pd.to_numeric(ov_df[c], errors="coerce")
+
+    render_table(
+        style_overview_table(ov_df),
+        use_container_width=True,
+        height=min(42 + 36 * n_sys, 700), hide_index=True)
 
     with st.expander("🔍 Data quality & validation details"):
         dq_rows = []
@@ -1601,7 +2449,7 @@ with tab1:
                 "Last cum $":   f"${last_cum:,.2f}" if last_cum is not None else "—",
                 "B5 match":     "✅" if si["b5_match"] else "❌",
             })
-        st.dataframe(pd.DataFrame(dq_rows), hide_index=True, use_container_width=True)
+        render_table(pd.DataFrame(dq_rows), hide_index=True, use_container_width=True)
 
         st.markdown("**Date ranges per system:**")
         dr_rows = []
@@ -1614,7 +2462,17 @@ with tab1:
                     "Last":     dates.max().strftime("%Y-%m-%d"),
                     "# Trades": len(si["trades"]),
                 })
-        st.dataframe(pd.DataFrame(dr_rows), hide_index=True, use_container_width=True)
+        render_table(pd.DataFrame(dr_rows), hide_index=True, use_container_width=True)
+
+    with st.expander("🧮 Metric methodology & precision", expanded=False):
+        st.markdown(
+            """- **Net Profit / Max DD:** calculated from the daily net equity curve after the configured per-contract commission.
+- **Profit Factor / Win Rate:** calculated from trade-level net P&L after commission.
+- **Sharpe / Calmar:** current formulas are preserved in this release; this section documents the methodology only.
+- **Sizing:** displayed P&L/equity is scaled by `current contracts / ReadMe default contracts`; raw TradeStation trade P&L is never modified.
+- **Precision:** calculations use the underlying numeric values; rounding happens only when tables/metrics are rendered.
+
+A deeper mathematical audit of portfolio risk, correlation, covariance quality, and Monte Carlo assumptions is now implemented in the risk engine and diagnostics below.""")
 
     st.divider()
 
@@ -1631,8 +2489,69 @@ with tab1:
     if trades_c.empty:
         st.warning("No trades found for this system.")
     else:
-        cutoff   = trades_c["exit_date"].max() - pd.Timedelta(days=int(lookback * 365))
-        tr_trim  = trades_c[trades_c["exit_date"] >= cutoff].copy()
+        dates_min = trades_c["exit_date"].min()
+        dates_max = trades_c["exit_date"].max()
+        valid_se_presets = [
+            "All history", "MTD", "YTD", "Past week", "Past 1 month", "Past 3 months",
+            "Past 6 months", "Past year", "Past 2 years", "2025", "2024", "Custom"]
+        if "se_date_preset" not in st.session_state or st.session_state["se_date_preset"] not in valid_se_presets:
+            st.session_state["se_date_preset"] = "All history"
+        if "se_custom_range" not in st.session_state or not isinstance(st.session_state["se_custom_range"], list):
+            st.session_state["se_custom_range"] = [dates_min.date(), dates_max.date()]
+
+        with st.expander("Date filter", expanded=True):
+            c1 = st.columns(6)
+            if c1[0].button("All history", key="se_all"):
+                st.session_state["se_date_preset"] = "All history"
+            if c1[1].button("MTD", key="se_mtd"):
+                st.session_state["se_date_preset"] = "MTD"
+            if c1[2].button("YTD", key="se_ytd"):
+                st.session_state["se_date_preset"] = "YTD"
+            if c1[3].button("Past week", key="se_week"):
+                st.session_state["se_date_preset"] = "Past week"
+            if c1[4].button("Past 1 month", key="se_1m"):
+                st.session_state["se_date_preset"] = "Past 1 month"
+            if c1[5].button("Past 3 months", key="se_3m"):
+                st.session_state["se_date_preset"] = "Past 3 months"
+
+            c2 = st.columns(6)
+            if c2[0].button("Past 6 months", key="se_6m"):
+                st.session_state["se_date_preset"] = "Past 6 months"
+            if c2[1].button("Past year", key="se_1y"):
+                st.session_state["se_date_preset"] = "Past year"
+            if c2[2].button("Past 2 years", key="se_2y"):
+                st.session_state["se_date_preset"] = "Past 2 years"
+            if c2[3].button("2025", key="se_2025"):
+                st.session_state["se_date_preset"] = "2025"
+            if c2[4].button("2024", key="se_2024"):
+                st.session_state["se_date_preset"] = "2024"
+            if c2[5].button("Custom", key="se_custom"):
+                st.session_state["se_date_preset"] = "Custom"
+
+            custom = st.date_input(
+                "Custom range",
+                value=st.session_state["se_custom_range"],
+                min_value=dates_min.date(),
+                max_value=dates_max.date(),
+                key="se_custom_range")
+
+            preset = st.session_state["se_date_preset"]
+            if preset == "Custom":
+                if isinstance(custom, tuple) or isinstance(custom, list):
+                    se_start = pd.Timestamp(custom[0])
+                    se_end = pd.Timestamp(custom[1])
+                else:
+                    se_start = pd.Timestamp(custom)
+                    se_end = pd.Timestamp(custom)
+            else:
+                se_start, se_end = resolve_portfolio_date_range(dates_min, dates_max, preset)
+
+            st.caption(f"Showing {se_start:%Y-%m-%d} → {se_end:%Y-%m-%d}  |  Active filter: {preset}")
+
+        # trim trades to selected date window
+        tr_trim = trades_c.copy()
+        tr_trim = tr_trim[(tr_trim["exit_date"] >= se_start) & (tr_trim["exit_date"] <= se_end)].copy()
+
         eq_net_c = build_net_equity(tr_trim, si_c["comm_per_trade"], ratio_c)
         if not eq_net_c.empty:
             eq_net_c = eq_net_c - eq_net_c.iloc[0]
@@ -1645,13 +2564,16 @@ with tab1:
             f"**Current sizing:** {cur_n_c} × {si_c['contract_type']} "
             f"(default: {si_c['default_n']}, scale: {ratio_c:.2f}×)  |  "
             f"**B5:** {'✅' if si_c['b5_match'] else '❌'}")
+        st.caption(
+            "**Metrics & equity curve:** scaled to current sizing.  "
+            "**Trade list P&L:** raw TradeStation dollars. Display rounding never changes calculations.")
 
         cols5 = st.columns(5)
         for col, (lbl, key, fmt) in zip(cols5, [
             ("Net Profit",   "Net Profit ($)",   "$"),
             ("Max Drawdown", "Max Drawdown ($)",  "$"),
-            ("Sharpe",       "Sharpe Ratio",      "f"),
-            ("PF",           "Profit Factor",     "f"),
+            ("P&L Sharpe",   "P&L Sharpe",        "f"),
+            ("Ann. P&L / DD", "Ann. P&L / Max DD", "f"),
             ("Win Rate",     "Win Rate",          "pct"),
         ]):
             v = m_c.get(key, 0)
@@ -1669,283 +2591,780 @@ with tab1:
                             use_container_width=True)
 
         with st.expander("📋 Trade list"):
+            st.caption("Raw TradeStation trade-level P&L; this table is intentionally not rescaled by the current sizing editor.")
             td = tr_trim[["trade_id","entry_date","exit_date",
                            "direction","n_contracts","pnl","cum_pnl"]].copy()
             td.columns = ["#","Entry","Exit","Dir","N Ctrts (TS)",
                           "Raw P&L ($)","Cum P&L ($)"]
-            st.dataframe(td, use_container_width=True, height=320)
+            # coerce numeric columns then style for display so sorting remains numeric
+            td["Entry"] = pd.to_datetime(td["Entry"], errors="coerce")
+            td["Exit"] = pd.to_datetime(td["Exit"], errors="coerce")
+            td["N Ctrts (TS)"] = pd.to_numeric(td["N Ctrts (TS)"], errors="coerce")
+            td["Raw P&L ($)"] = pd.to_numeric(td["Raw P&L ($)"], errors="coerce")
+            td["Cum P&L ($)"] = pd.to_numeric(td["Cum P&L ($)"], errors="coerce")
+            render_table(td, use_container_width=True, height=320)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TAB 2 — PORTFOLIO
 # ═════════════════════════════════════════════════════════════════════════════
 
-with tab2:
-    st.subheader("Portfolio Builder")
-    st.caption(
-        "Portfolio equity = sum of per-system net-equity curves scaled by "
-        "current sizing ratios (set in Tab 1).")
+def _render_tab2():
+        st.subheader("Portfolio Builder")
+        st.caption(
+            "Portfolio equity = sum of per-system net-equity curves scaled by "
+            "current sizing ratios (set in Tab 1).")
 
-    selected_systems = st.multiselect(
-        "Select systems to include",
-        _active_stems,
-        default=_active_stems,
-        format_func=lambda x: systems[x]["display_name"])
+        selected_systems = st.multiselect(
+            "Select systems to include",
+            _active_stems,
+            default=_active_stems,
+            format_func=lambda x: systems[x]["display_name"])
 
-    if not selected_systems:
-        st.info("Select at least one system.")
-        st.stop()
+        if not selected_systems:
+            st.info("Select at least one system.")
+            return
 
-    # Build portfolio using current sizing from session_state
-    # Skip systems where current sizing = 0 (they contribute nothing)
-    curves     = {}
-    label_map  = {}
-    for stem in selected_systems:
-        si    = systems[stem]
-        ratio = _cur_ratio(stem)
-        if ratio == 0.0:
-            continue
-        eq    = get_net_equity_trimmed(si, lookback, ratio)
-        if not eq.empty:
-            curves[stem]    = eq
-            label_map[stem] = si["display_name"][:30]
+        dates_min = min(systems[s]["trades"]["exit_date"].min() for s in selected_systems)
+        dates_max = max(systems[s]["trades"]["exit_date"].max() for s in selected_systems)
 
-    if not curves:
-        st.warning("No valid equity curves.")
-        st.stop()
+        valid_presets = [
+            "All history", "MTD", "YTD", "Past week", "Past 1 month", "Past 3 months",
+            "Past 6 months", "Past year", "Past 2 years", "2025", "2024", "Custom"]
+        if "pf_date_preset" not in st.session_state or st.session_state["pf_date_preset"] not in valid_presets:
+            st.session_state["pf_date_preset"] = "All history"
 
-    eq_df   = combine_equity_curves(curves, lookback_years=lookback)
-    port_eq = eq_df.sum(axis=1)
-    pm      = compute_portfolio_metrics(port_eq)
+        _safe_date_range_state("pf_custom_range", dates_min, dates_max)
 
-    mc6 = st.columns(6)
-    for col, (lbl, key, fmt) in zip(mc6, [
-        ("Portfolio P&L",   "Net Profit ($)",   "$"),
-        ("Ann. Return",     "Ann. Return ($)",   "$"),
-        ("Max Drawdown",    "Max Drawdown ($)",  "$"),
-        ("Ann. Volatility", "Ann. Volatility",   "$"),
-        ("Sharpe",          "Sharpe Ratio",      "f"),
-        ("Calmar",          "Calmar Ratio",      "f"),
-    ]):
-        v = pm.get(key, 0)
-        col.metric(lbl, f"${v:,.0f}" if fmt == "$" else f"{v:.2f}")
+        with st.expander("Date filter", expanded=True):
+            btn_cols1 = st.columns(6)
+            if btn_cols1[0].button("All history", key="pf_all"):
+                st.session_state["pf_date_preset"] = "All history"
+            if btn_cols1[1].button("MTD", key="pf_mtd"):
+                st.session_state["pf_date_preset"] = "MTD"
+            if btn_cols1[2].button("YTD", key="pf_ytd"):
+                st.session_state["pf_date_preset"] = "YTD"
+            if btn_cols1[3].button("Past week", key="pf_week"):
+                st.session_state["pf_date_preset"] = "Past week"
+            if btn_cols1[4].button("Past 1 month", key="pf_1m"):
+                st.session_state["pf_date_preset"] = "Past 1 month"
+            if btn_cols1[5].button("Past 3 months", key="pf_3m"):
+                st.session_state["pf_date_preset"] = "Past 3 months"
 
-    st.plotly_chart(
-        plot_portfolio_equity(port_eq, eq_df, label_map=label_map),
-        use_container_width=True)
+            btn_cols2 = st.columns(6)
+            if btn_cols2[0].button("Past 6 months", key="pf_6m"):
+                st.session_state["pf_date_preset"] = "Past 6 months"
+            if btn_cols2[1].button("Past year", key="pf_1y"):
+                st.session_state["pf_date_preset"] = "Past year"
+            if btn_cols2[2].button("Past 2 years", key="pf_2y"):
+                st.session_state["pf_date_preset"] = "Past 2 years"
+            if btn_cols2[3].button("2025", key="pf_2025"):
+                st.session_state["pf_date_preset"] = "2025"
+            if btn_cols2[4].button("2024", key="pf_2024"):
+                st.session_state["pf_date_preset"] = "2024"
+            if btn_cols2[5].button("Custom", key="pf_custom"):
+                st.session_state["pf_date_preset"] = "Custom"
 
-    # Contribution bar
-    st.subheader("System Contribution to Portfolio P&L")
-    contrib  = {s: eq_df[s].iloc[-1] - eq_df[s].iloc[0] for s in eq_df.columns}
-    cs       = pd.Series(contrib).sort_values(ascending=True)
-    bar_labels = [systems[k]["display_name"][:38] for k in cs.index]
-    fig_bar  = go.Figure(go.Bar(
-        x=cs.values, y=bar_labels, orientation="h",
-        marker_color=[C["red"] if v < 0 else C["green"] for v in cs.values],
-        text=[f"${v:,.0f}" for v in cs.values],
-        textposition="outside"))
-    fig_bar.update_layout(template=THEME, height=max(300, 38 * len(cs)),
-                           margin=dict(l=0, r=70, t=10, b=0),
-                           xaxis_title="P&L Contribution ($)")
-    st.plotly_chart(fig_bar, use_container_width=True, key="chart_1")
+            custom_range = st.date_input(
+                "Custom range",
+                value=st.session_state["pf_custom_range"],
+                min_value=dates_min.date(),
+                max_value=dates_max.date(),
+                key="pf_custom_range")
 
-    st.plotly_chart(plot_monthly_heatmap(port_eq, "Portfolio"), use_container_width=True)
+            if st.button("Use custom range", key="pf_use_custom"):
+                st.session_state["pf_date_preset"] = "Custom"
 
-    # ── Drawdown Decomposition ────────────────────────────────────────────────
-    st.subheader("🔍 Drawdown Decomposition")
-    st.caption("For each major portfolio drawdown, which system caused it?")
-    dd_episodes = decompose_drawdown(eq_df, port_eq, top_n=3)
-    if dd_episodes:
-        for ep_i, ep in enumerate(dd_episodes):
-            title = (f"DD #{ep_i+1}:  {ep['peak_date'].strftime('%Y-%m-%d')} → "
-                     f"{ep['trough_date'].strftime('%Y-%m-%d')}  "
-                     f"(Loss: ${ep['dd_abs']:,.0f})")
-            with st.expander(title, expanded=(ep_i == 0)):
-                blame_s = sorted(ep["blame_pct"].items(),
-                                  key=lambda x: x[1], reverse=True)
-                blame_s = [(k, v) for k, v in blame_s if v > 0][:8]
-                if blame_s:
-                    bkeys = [systems[k]["display_name"][:30] if k in systems else k[:30]
-                             for k, _ in blame_s]
-                    bvals = [v for _, v in blame_s]
-                    fig_b = go.Figure(go.Bar(
-                        y=bkeys, x=bvals, orientation="h",
-                        marker_color=[C["red"] if v > 15 else C["amber"] for v in bvals],
-                        text=[f"{v:.1f}%" for v in bvals],
-                        textposition="outside"))
-                    fig_b.update_layout(template=THEME,
-                                         height=max(200, 35 * len(bkeys)),
-                                         margin=dict(l=0, r=60, t=10, b=0),
-                                         xaxis_title="Blame (%)")
-                    st.plotly_chart(fig_b, use_container_width=True, key=f"chart_2_{ep_i}")
-    else:
-        st.info("No significant drawdown episodes in this lookback window.")
+            preset = st.session_state["pf_date_preset"]
+            if preset == "Custom":
+                if isinstance(custom_range, tuple):
+                    start_date = pd.Timestamp(custom_range[0])
+                    end_date = pd.Timestamp(custom_range[1])
+                else:
+                    start_date = pd.Timestamp(custom_range)
+                    end_date = pd.Timestamp(custom_range)
+            else:
+                start_date, end_date = resolve_portfolio_date_range(dates_min, dates_max, preset)
 
-    with st.expander("📉 Overall Drawdown Analysis"):
-        dd     = port_eq - port_eq.cummax()
-        dd_neg = dd[dd < 0]
-        if not dd_neg.empty:
-            d1, d2, d3 = st.columns(3)
-            d1.metric("Max Drawdown",     f"${dd_neg.min():,.0f}")
-            d2.metric("Avg Drawdown",     f"${dd_neg.mean():,.0f}")
-            d3.metric("Time in Drawdown", f"{len(dd_neg)/len(dd)*100:.1f}%")
-            fig_dd = go.Figure(go.Scatter(
-                x=dd.index, y=dd.values, fill="tozeroy",
-                line=dict(color=C["dd_line"]), fillcolor=C["drawdown"]))
-            fig_dd.update_layout(template=THEME, height=240,
-                                  margin=dict(l=0, r=0, t=0, b=0),
-                                  yaxis_title="Drawdown ($)")
-            st.plotly_chart(fig_dd, use_container_width=True, key="chart_3")
+            st.caption(f"Showing {start_date:%Y-%m-%d} → {end_date:%Y-%m-%d}  |  Active filter: {preset}")
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — CORRELATION & OPTIMISATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-with tab3:
-    all_curves = {}
-    for stem in _active_stems:
-        si = systems[stem]
-        eq = get_net_equity_trimmed(si, lookback, _cur_ratio(stem))
-        if not eq.empty:
-            all_curves[stem] = eq
-
-    if len(all_curves) < 2:
-        st.info("Need ≥ 2 systems with data.")
-        st.stop()
-
-    corr_df  = combine_equity_curves(all_curves, lookback_years=lookback)
-    daily_r  = corr_df.diff().dropna()
-    corr_mat = daily_r.corr()
-
-    # ── Clustered Correlation ─────────────────────────────────────────────────
-    st.subheader("Clustered Correlation Heatmap")
-    st.caption("Ward-linkage hierarchical clustering. 🔴 boxes = over-exposed pairs.")
-
-    over_exp_thresh = st.slider("Over-exposed threshold (ρ)", 0.5, 0.95, 0.70, 0.05)
-    cluster_score   = compute_cluster_risk_score(corr_mat)
-    upper           = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(bool))
-    corr_vals       = upper.stack()
-    n_overexp       = (corr_vals > over_exp_thresh).sum()
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Cluster Risk Score", f"{cluster_score:.0f}/100",
-              help="0 = uncorrelated, 100 = all move together")
-    c2.metric("Avg Pairwise ρ",     f"{corr_vals.mean():.3f}")
-    c3.metric(f"Pairs ρ>{over_exp_thresh}", f"{n_overexp}",
-              delta="⚠️ Concentration!" if n_overexp > 3 else "OK",
-              delta_color="inverse")
-
-    st.plotly_chart(
-        plot_clustered_correlation(corr_mat, systems, over_exp_thresh),
-        use_container_width=True)
-
-    high_corr = corr_vals[corr_vals > over_exp_thresh].sort_values(ascending=False)
-    if not high_corr.empty:
-        with st.expander(f"⚠️ Over-exposed pairs (ρ > {over_exp_thresh})"):
-            hc_df = pd.DataFrame({
-                "System A":    [systems.get(i[0], {}).get("display_name", i[0])[:38]
-                                for i in high_corr.index],
-                "System B":    [systems.get(i[1], {}).get("display_name", i[1])[:38]
-                                for i in high_corr.index],
-                "Correlation": high_corr.values.round(3),
-                "Risk":        ["🔴 High" if v > 0.85 else "🟡 Watch"
-                                for v in high_corr.values],
-            })
-            st.dataframe(hc_df, hide_index=True, use_container_width=True)
-
-    st.divider()
-
-    # ── Risk Parity ───────────────────────────────────────────────────────────
-    st.subheader("⚖️ Risk Parity Sizing (Advisory)")
-    st.caption(
-        f"Inverse-volatility weighting targeting **${rp_target:,.0f}/day** per system. "
-        "These are advisory — use the Tab 1 editor to apply them.")
-
-    rp_rows = []
-    for stem in _active_stems:
-        si = systems[stem]
-        d  = _rp_detail.get(stem, {})
-        rp_rows.append({
-            "System":        si["display_name"][:35],
-            "Symbol":        si["symbol"],
-            "Contract":      si["contract_label"],
-            "Daily Vol ($)": f"${d.get('vol_1ct', 0):,.0f}",
-            "Raw N":         f'{d.get("raw_n", si["default_n"]):.1f}',
-            "RP Advisory N": _rp_sizing.get(stem, si["default_n"]),
-            "Current N":     st.session_state["sizing"].get(stem, si["default_n"]),
-        })
-    st.dataframe(pd.DataFrame(rp_rows), hide_index=True, use_container_width=True)
-
-    st.divider()
-
-    # ── Recommended Sub-Portfolios ────────────────────────────────────────────
-    st.subheader("🎯 Recommended Sub-Portfolios")
-    st.caption("Subsets selected by different risk/return criteria.")
-
-    reccos = recommend_portfolios(corr_df, systems)
-    for rec_i, rec in enumerate(reccos):
-        with st.expander(f"{rec['name']} — {rec['description']}"):
-            rec_stems = [s for s in rec["systems"] if s in all_curves]
-            if not rec_stems:
-                st.write("Insufficient data.")
+        # Build portfolio using current sizing from session_state
+        # Skip systems where current sizing = 0 (they contribute nothing)
+        curves     = {}
+        label_map  = {}
+        for stem in selected_systems:
+            si    = systems[stem]
+            ratio = _cur_ratio(stem)
+            if ratio == 0.0:
                 continue
-            ratios_rec = {s: _cur_ratio(s) for s in rec_stems}
-            rec_eq     = build_portfolio_equity(systems, rec_stems, lookback, ratios_rec)
-            rec_m      = compute_portfolio_metrics(rec_eq)
-            mc4 = st.columns(4)
-            for col, (lbl, key, fmt) in zip(mc4, [
-                ("Net P&L", "Net Profit ($)", "$"), ("Sharpe", "Sharpe Ratio", "f"),
-                ("Max DD",  "Max Drawdown ($)", "$"), ("Calmar", "Calmar Ratio", "f"),
-            ]):
-                v = rec_m.get(key, 0)
-                col.metric(lbl, f"${v:,.0f}" if fmt == "$" else f"{v:.2f}")
-            if not rec_eq.empty:
-                norm = rec_eq - rec_eq.iloc[0]
-                fig_r = go.Figure(go.Scatter(x=norm.index, y=norm.values,
-                                              line=dict(color=C["blue"], width=2)))
-                fig_r.update_layout(template=THEME, height=320,
-                                     margin=dict(l=0, r=0, t=10, b=0),
-                                     yaxis_title="Cum. P&L ($)")
-                st.plotly_chart(fig_r, use_container_width=True, key=f"chart_4_{rec_i}")
+            eq    = get_net_equity_trimmed(si, lookback, ratio)
+            if not eq.empty:
+                curves[stem]    = eq
+                label_map[stem] = si["display_name"][:30]
 
-    st.divider()
+        if not curves:
+            st.warning("No valid equity curves.")
+            return
 
-    # ── Risk / Return scatter ─────────────────────────────────────────────────
-    st.subheader("Risk / Return Scatter")
-    scatter_rows = []
-    for stem in corr_df.columns:
-        d   = daily_r[stem]
-        col = corr_df[stem]
-        net   = col.iloc[-1] - col.iloc[0]
-        n_yr  = max((col.index[-1] - col.index[0]).days / 365.25, 0.01)
-        ann_r = net / n_yr
-        ann_v = d.std() * np.sqrt(252)
-        sharpe_v = ann_r / ann_v if ann_v > 0 else 0
-        max_dd_v = (col - col.cummax()).min()
-        scatter_rows.append({
-            "System":         systems.get(stem, {}).get("display_name", stem)[:32],
-            "Symbol":         systems.get(stem, {}).get("symbol", ""),
-            "Sharpe":         round(float(sharpe_v), 2),
-            "Max DD ($)":     round(float(max_dd_v), 0),
-            "Ann Return ($)": round(float(ann_r), 0),
-            "_sz":            max(abs(float(ann_r)), 1.0),
-        })
-    if scatter_rows:
-        sc_df  = pd.DataFrame(scatter_rows)
-        fig_sc = px.scatter(sc_df, x="Max DD ($)", y="Sharpe",
-                            text="System", color="Symbol",
-                            size="_sz", size_max=42, template=THEME,
-                            title="Sharpe vs Max Drawdown  (bubble = |Ann. Return|)",
-                            hover_data={"Ann Return ($)": True, "_sz": False})
-        fig_sc.update_traces(textposition="top center")
-        fig_sc.update_layout(height=520, margin=dict(l=0, r=0, t=40, b=0))
-        st.plotly_chart(fig_sc, use_container_width=True, key="chart_5")
+        raw_eq_df = pd.concat(curves.values(), axis=1, keys=curves.keys()).sort_index()
+        live_system_count = raw_eq_df.notna().sum(axis=1)
+        eq_df = raw_eq_df.dropna(how="any") if constant_composition else combine_equity_curves(curves, lookback_years=lookback)
+        if eq_df.empty:
+            st.warning("No portfolio data available for the selected date range.")
+            return
+
+        if preset == "All history":
+            start_date = eq_df.index.min()
+            end_date = eq_df.index.max()
+        else:
+            start_date, end_date = resolve_portfolio_date_range(eq_df.index.min(), eq_df.index.max(), preset) if preset != "Custom" else (start_date, end_date)
+
+        eq_df   = filter_equity_by_date_range(eq_df, start_date, end_date)
+        if eq_df.empty:
+            st.warning("No portfolio data available for the selected date range.")
+            return
+        if constant_composition:
+            eq_df = eq_df.dropna(how="any")
+            if eq_df.empty:
+                st.warning("No common constant-composition period exists for the selected date range.")
+                return
+
+        eq_df   = eq_df - eq_df.iloc[0]
+        port_eq = eq_df.sum(axis=1)
+        pm      = compute_portfolio_metrics(port_eq)
+
+        # Capital / risk context: this is the bridge between historical strategy P&L
+        # and the actual account size you are using today.
+        _recent_sizing = {stem: st.session_state["sizing"].get(stem, systems[stem]["default_n"]) for stem in selected_systems}
+        _risk_engine = portfolio_risk(systems, selected_systems, _recent_sizing, lookback, window_days=126, date_start=start_date, date_end=end_date, min_overlap_days=252)
+        portfolio_daily_risk = float(_risk_engine.get("portfolio_daily_vol", 0.0))
+        st.session_state["_canonical_tab2_risk"] = {"vol": portfolio_daily_risk, "systems": tuple(sorted(selected_systems)), "start": _risk_engine.get("start"), "end": _risk_engine.get("end")}
+        _risk_obs = int(_risk_engine.get("observations", 0)); _risk_start = _risk_engine.get("start"); _risk_end = _risk_engine.get("end")
+        long_run_ann_vol_usd = float(pm.get("Ann. Volatility ($)", 0))
+        if portfolio_daily_risk <= 0:
+            portfolio_daily_risk = long_run_ann_vol_usd / np.sqrt(252)
+            _risk_label = "long-run fallback (recent risk unavailable)"
+        else:
+            _risk_label = f"recent {_risk_obs}-day constant-composition estimate for selected systems"
+        risk_equity = portfolio_daily_risk / account_balance if account_balance > 0 else 0.0
+        ann_risk_equity = portfolio_daily_risk * np.sqrt(252) / account_balance if account_balance > 0 else 0.0
+        target_risk = target_annual_risk / 100.0
+        risk_budget_used = ann_risk_equity / target_risk if target_risk > 0 else 0.0
+        portfolio_scale_to_target = target_risk / ann_risk_equity if ann_risk_equity > 0 else 0.0
+        available_daily_risk = max(target_risk * account_balance / np.sqrt(252) - portfolio_daily_risk, 0.0)
+        worst_day = float(port_eq.diff().dropna().min()) if len(port_eq) > 1 else 0.0
+
+        st.subheader("💰 Capital & Risk Context")
+        st.caption(
+            "The account balance is a user-defined capital reference. It does not change historical P&L; "
+            "it tells you how hard the current book is leaning on the capital you actually have available. "
+            "The target-risk figures are sizing references, not forecasts or margin requirements.")
+        cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+        metric_with_help(cc1, "Account Balance", f"${account_balance:,.0f}", help=METRIC_HELP.get("Account Balance"))
+        metric_with_help(cc2, "Current Daily Risk", f"${portfolio_daily_risk:,.0f}",
+                         help="""**Formula:** standard deviation of combined daily P&L over the most recent 126 valid trading days, using only currently active systems.
+
+    **Purpose:** estimate recent diversified portfolio risk rather than a decade-long average.
+
+    **In plain English:** what does the book look capable of wobbling by now?
+
+    - This is a volatility estimate, not a worst-case loss or margin requirement.""")
+        metric_with_help(cc3, "Daily Risk / Equity", f"{risk_equity:.2%}", help=METRIC_HELP.get("Daily Risk / Equity"))
+        metric_with_help(cc4, "Annualized Risk / Equity", f"{ann_risk_equity:.1%}", help=METRIC_HELP.get("Annualized Risk / Equity"))
+        metric_with_help(cc5, "Target Annual Risk", f"{target_risk:.0%}",
+                         help="User-defined target for annualized portfolio P&L volatility relative to account equity. In plain English: your chosen risk speed limit.")
+
+        rcx1, rcx2, rcx3, rcx4 = st.columns(4)
+        metric_with_help(rcx1, "Risk Budget Used", f"{risk_budget_used:.0%}",
+                         help="Formula: current annualized risk / target annualized risk. Purpose: show how much of the chosen risk budget the current book consumes. In plain English: 100% is on the speed limit; 130% means we are already 30% over it.")
+        metric_with_help(rcx2, "Scale to Target", f"{portfolio_scale_to_target:.2f}×",
+                         help="Formula: target annualized risk / current annualized risk. Purpose: estimate the uniform sizing multiplier that would bring current portfolio risk to the target. In plain English: 0.80× means cut every position by roughly 20%; 1.20× means the book could be about 20% larger. This preserves the current relative system weights.")
+        metric_with_help(rcx3, "Available Daily Risk", f"${available_daily_risk:,.0f}",
+                         help="Formula: target daily risk budget minus current daily risk, floored at zero. Purpose: show remaining risk capacity before hitting the chosen annualized-risk target. In plain English: how much more normal daily turbulence can we afford?")
+        metric_with_help(rcx4, "Worst Historical Day", f"${worst_day:,.0f}",
+                         help="Largest one-day portfolio P&L loss in the selected history. Purpose: show realized tail pain. In plain English: the ugliest single trading day in the book's history — not a forecast of the next one.")
+        _risk_dates = f"{_risk_start:%Y-%m-%d} → {_risk_end:%Y-%m-%d}" if _risk_start is not None else "n/a"
+        st.caption(f"Current-risk basis: **{_risk_label}** ({_risk_dates}). Full-window annualized volatility remains **${long_run_ann_vol_usd:,.0f}** for historical context.")
+
+        if ann_risk_equity > 0:
+            status = "🟢 Below target" if risk_budget_used <= 0.95 else ("🟡 Near target" if risk_budget_used <= 1.05 else "🔴 Above target")
+            st.caption(
+                f"**Risk budget:** {status}. Current book is using **{risk_budget_used:.0%}** of the "
+                f"chosen {target_risk:.0%} annualized-risk target. A uniform **{portfolio_scale_to_target:.2f}×** "
+                "scaling of all positions is the first-order sizing required to hit the target, because "
+                "portfolio P&L volatility scales linearly when every position is scaled together.")
+
+        mc5 = st.columns(5)
+        for col, (lbl, key, fmt) in zip(mc5, [
+            ("Portfolio P&L",   "Net Profit ($)",   "$"),
+            ("Ann. P&L",        "Ann. P&L ($)",      "$"),
+            ("Max Drawdown",    "Max Drawdown ($)",  "$"),
+            ("P&L Sharpe",      "P&L Sharpe",        "f"),
+            ("Ann. P&L / Max DD", "Ann. P&L / Max DD", "f"),
+        ]):
+            v = pm.get(key, 0)
+            metric_with_help(col, lbl, f"${v:,.0f}" if fmt == "$" else f"{v:.2f}")
+
+        st.plotly_chart(
+            plot_portfolio_equity(port_eq, eq_df, label_map=label_map),
+            use_container_width=True)
+        live_subset = live_system_count[(live_system_count.index >= start_date) & (live_system_count.index <= end_date)]
+        if not live_subset.empty:
+            st.caption("Live-system count before the constant-composition filter. This shows where unfiltered portfolio statistics would change their risk base over time.")
+            fig_live = go.Figure(go.Scatter(x=live_subset.index, y=live_subset.values, mode="lines", name="Live systems"))
+            fig_live.update_layout(template=THEME, height=180, margin=dict(l=0,r=0,t=10,b=0), yaxis_title="# live systems")
+            st.plotly_chart(fig_live, use_container_width=True, key="chart_live_system_count_v251")
+
+        # Contribution bar
+        st.subheader("System Contribution to Portfolio P&L")
+        contrib  = {s: eq_df[s].iloc[-1] - eq_df[s].iloc[0] for s in eq_df.columns}
+        cs       = pd.Series(contrib).sort_values(ascending=True)
+        bar_labels = [systems[k]["display_name"][:38] for k in cs.index]
+        fig_bar  = go.Figure(go.Bar(
+            x=cs.values, y=bar_labels, orientation="h",
+            marker_color=[C["red"] if v < 0 else C["green"] for v in cs.values],
+            text=[f"${v:,.0f}" for v in cs.values],
+            textposition="outside"))
+        fig_bar.add_shape(
+            type="line",
+            x0=0, x1=0, y0=-0.5, y1=len(cs) - 0.5,
+            line=dict(color="black", width=2))
+        fig_bar.update_layout(template=THEME, height=max(300, 38 * len(cs)),
+                               margin=dict(l=0, r=70, t=10, b=0),
+                               xaxis_title="P&L Contribution ($)",
+                               xaxis=dict(zeroline=True, zerolinewidth=2, zerolinecolor="black"))
+        st.plotly_chart(fig_bar, use_container_width=True, key="chart_1")
+
+        st.plotly_chart(plot_monthly_heatmap(port_eq, "Portfolio"), use_container_width=True)
+
+        # ── Drawdown Decomposition ────────────────────────────────────────────────
+        st.subheader("🔍 Drawdown Decomposition")
+        st.caption("For each major portfolio drawdown, which system caused it?")
+        dd_episodes = decompose_drawdown(eq_df, port_eq, top_n=3)
+        if dd_episodes:
+            for ep_i, ep in enumerate(dd_episodes):
+                title = (f"DD #{ep_i+1}:  {ep['peak_date'].strftime('%Y-%m-%d')} → "
+                         f"{ep['trough_date'].strftime('%Y-%m-%d')}  "
+                         f"(Loss: ${ep['dd_abs']:,.0f})")
+                with st.expander(title, expanded=(ep_i == 0)):
+                    blame_s = sorted(ep["blame_pct"].items(),
+                                      key=lambda x: x[1], reverse=True)
+                    blame_s = [(k, v) for k, v in blame_s if v > 0][:8]
+                    if blame_s:
+                        bkeys = [systems[k]["display_name"][:30] if k in systems else k[:30]
+                                 for k, _ in blame_s]
+                        bvals = [v for _, v in blame_s]
+                        fig_b = go.Figure(go.Bar(
+                            y=bkeys, x=bvals, orientation="h",
+                            marker_color=[C["red"] if v > 15 else C["amber"] for v in bvals],
+                            text=[f"{v:.1f}%" for v in bvals],
+                            textposition="outside"))
+                        fig_b.update_layout(template=THEME,
+                                             height=max(200, 35 * len(bkeys)),
+                                             margin=dict(l=0, r=60, t=10, b=0),
+                                             xaxis_title="Blame (%)")
+                        st.plotly_chart(fig_b, use_container_width=True, key=f"chart_2_{ep_i}")
+        else:
+            st.info("No significant drawdown episodes in this lookback window.")
+
+        with st.expander("📉 Overall Drawdown Analysis"):
+            dd     = port_eq - port_eq.cummax()
+            dd_neg = dd[dd < 0]
+            if not dd_neg.empty:
+                d1, d2, d3 = st.columns(3)
+                metric_with_help(d1, "Max Drawdown",     f"${dd_neg.min():,.0f}")
+                d2.metric("Avg Drawdown",     f"${dd_neg.mean():,.0f}")
+                d3.metric("Time in Drawdown", f"{len(dd_neg)/len(dd)*100:.1f}%")
+                fig_dd = go.Figure(go.Scatter(
+                    x=dd.index, y=dd.values, fill="tozeroy",
+                    line=dict(color=C["dd_line"]), fillcolor=C["drawdown"]))
+                fig_dd.update_layout(template=THEME, height=240,
+                                      margin=dict(l=0, r=0, t=0, b=0),
+                                      yaxis_title="Drawdown ($)")
+                st.plotly_chart(fig_dd, use_container_width=True, key="chart_3")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — FORWARD ANALYSIS
-# ═════════════════════════════════════════════════════════════════════════════
+    # ═════════════════════════════════════════════════════════════════════════════
+    # TAB 3 — CORRELATION & OPTIMISATION
+    # ═════════════════════════════════════════════════════════════════════════════
+
+_render_tab2()
+
+def _render_tab3():
+        _current_sizing_map = {
+            stem: st.session_state["sizing"].get(stem, systems[stem]["default_n"])
+            for stem in _active_stems
+        }
+
+        all_curves = {}
+        for stem in _active_stems:
+            si = systems[stem]
+            eq = get_net_equity_trimmed(si, lookback, _cur_ratio(stem))
+            if not eq.empty:
+                all_curves[stem] = eq
+
+        if len(all_curves) < 2:
+            st.info("Need ≥ 2 systems with data.")
+            return
+
+        daily_r = build_correlation_daily_pnl(all_curves, lookback_years=lookback)
+        corr_mat, cov_mat, overlap_mat = _pairwise_corr_cov(daily_r, min_overlap_days=63)
+        _weekly_pnl = _build_periodic_trade_pnl(systems, _active_stems, lookback, _current_sizing_map, "W")
+        _monthly_pnl = _build_periodic_trade_pnl(systems, _active_stems, lookback, _current_sizing_map, "M")
+        weekly_corr = _weekly_pnl.corr(min_periods=12) if not _weekly_pnl.empty else pd.DataFrame()
+        monthly_corr = _monthly_pnl.corr(min_periods=6) if not _monthly_pnl.empty else pd.DataFrame()
+
+        if corr_mat.empty or corr_mat.shape[1] < 2:
+            st.warning("Not enough overlapping history to calculate portfolio correlation.")
+            return
+
+        upper = corr_mat.where(np.triu(np.ones(corr_mat.shape), k=1).astype(bool))
+        corr_vals = upper.stack()
+        if corr_vals.empty:
+            st.warning("No valid system pairs with enough overlapping history.")
+            return
+
+        risk_stats = portfolio_risk(systems, _active_stems, _current_sizing_map, lookback, min_overlap_days=252)
+        over_exp_thresh = st.slider("Over-exposed threshold (ρ)", 0.5, 0.95, 0.70, 0.05)
+        _primary_corr = monthly_corr if not monthly_corr.empty else corr_mat
+        cluster_labels = extract_correlation_clusters(_primary_corr, over_exp_thresh)
+        n_overexp = int((corr_vals > over_exp_thresh).sum())
+
+        # ── Diversification summary ───────────────────────────────────────────────
+        st.subheader("Portfolio Correlation & Diversification")
+        st.info(
+            "**Start here:** this section answers one simple question: **are my 16 systems actually diversifying each other, or are several of them taking the same risk?**\n\n"
+            "- **Correlation (ρ):** how similarly two systems tend to make or lose money on the same day.\n"
+            "- **Portfolio Daily Vol:** the volatility of the *combined* book after those relationships are taken into account.\n"
+            "- **Risk Contribution:** which systems are responsible for the portfolio's total risk.\n"
+            "- **Clusters:** groups of systems that behave similarly.\n\n"
+            "The important distinction is: **system volatility tells us how risky a system is alone; correlation tells us how much that risk overlaps with the rest of the portfolio.**")
+        st.caption(
+            "Correlation is based on overlapping daily dollar P&L. Missing history is left missing, "
+            "rather than treated as zero P&L. Current sizing is used for volatility and risk contribution.")
+
+        d1, d2, d3, d4, d5, d6 = st.columns(6)
+        metric_with_help(d1, "Portfolio Daily Vol", f"${risk_stats.get('portfolio_daily_vol', 0):,.0f}")
+        metric_with_help(d2, "Sum Individual Vol", f"${risk_stats.get('sum_individual_vol', 0):,.0f}")
+        metric_with_help(d3, "Diversification Ratio", f"{risk_stats.get('diversification_ratio', np.nan):.2f}")
+        metric_with_help(d4, "Avg Daily ρ", f"{corr_vals.mean():.2f}")
+        _weekly_vals = weekly_corr.where(np.triu(np.ones(weekly_corr.shape), k=1).astype(bool)).stack() if not weekly_corr.empty else pd.Series(dtype=float)
+        _monthly_vals = monthly_corr.where(np.triu(np.ones(monthly_corr.shape), k=1).astype(bool)).stack() if not monthly_corr.empty else pd.Series(dtype=float)
+        metric_with_help(d5, "Avg Monthly ρ", f"{_monthly_vals.mean():.2f}" if not _monthly_vals.empty else "n/a")
+        metric_with_help(d6, "Effective Bets (monthly)", f"{_effective_independent_bets(monthly_corr):.1f}" if not monthly_corr.empty else "n/a")
+
+        c1, c2 = st.columns(2)
+        c1.metric(f"Daily pairs ρ > {over_exp_thresh:.2f}", f"{n_overexp}",
+                  delta="⚠️ Concentration" if n_overexp > 3 else "OK",
+                  delta_color="inverse")
+        c2.metric("Active systems", f"{len(corr_mat)}")
+
+        st.caption(
+            "Portfolio Daily Vol is the volatility of the combined book after correlations. "
+            "Sum Individual Vol is what the risk would look like if every system moved together. "
+            "The gap between them is diversification doing useful work.")
+        _horizon_rows = []
+        for _label, _mat, _desc in [("Daily", corr_mat, "Short-term co-movement"), ("Weekly", weekly_corr, "Intermediate diversification"), ("Monthly", monthly_corr, "Primary structural-diversification measure")]:
+            if _mat.empty: continue
+            _vals = _mat.where(np.triu(np.ones(_mat.shape), k=1).astype(bool)).stack()
+            _horizon_rows.append({"Horizon": _label, "Average pairwise ρ": float(_vals.mean()) if not _vals.empty else np.nan, "Effective independent bets": _effective_independent_bets(_mat), "Interpretation": _desc})
+        if _horizon_rows: render_table(pd.DataFrame(_horizon_rows), hide_index=True, use_container_width=True)
+        q1, q2, q3 = st.columns(3)
+        q1.metric("LW shrinkage intensity", f"{risk_stats.get('shrinkage_intensity', np.nan):.1%}" if np.isfinite(risk_stats.get('shrinkage_intensity', np.nan)) else "n/a")
+        q2.metric("Minimum pairwise overlap", f"{risk_stats.get('min_pairwise_overlap', 0):,} days")
+        q3.metric("PSD correction (Frobenius)", f"{risk_stats.get('psd_correction_frobenius', 0):.2f}")
+        _psd_correction = float(risk_stats.get("psd_correction_frobenius", 0) or 0)
+        if _psd_correction > 1e-6:
+            st.warning("⚠️ The pairwise covariance matrix required a material PSD correction. The canonical portfolio volatility is still computed directly from complete daily P&L observations.")
+
+        # ── Clustered Correlation ─────────────────────────────────────────────────
+        st.subheader("Clustered Correlation Heatmap")
+        st.caption("Average-linkage clustering. Cluster assignment uses the monthly correlation matrix as the primary structural-diversification horizon; the heatmap shows daily correlation. Boxes mark pairs above the selected threshold.")
+        st.plotly_chart(
+            plot_clustered_correlation(corr_mat, systems, over_exp_thresh),
+            use_container_width=True)
+
+        _primary_upper = _primary_corr.where(np.triu(np.ones(_primary_corr.shape), k=1).astype(bool))
+        high_corr = _primary_upper.stack()
+        high_corr = high_corr[high_corr > over_exp_thresh].sort_values(ascending=False)
+        if not high_corr.empty:
+            with st.expander(f"⚠️ Over-exposed pairs (ρ > {over_exp_thresh:.2f})", expanded=False):
+                hc_df = pd.DataFrame({
+                    "System A":    [systems.get(i[0], {}).get("display_name", i[0])[:38]
+                                    for i in high_corr.index],
+                    "System B":    [systems.get(i[1], {}).get("display_name", i[1])[:38]
+                                    for i in high_corr.index],
+                    "Correlation": high_corr.values,
+                    "Risk":        ["🔴 High" if v > 0.85 else "🟡 Watch"
+                                    for v in high_corr.values],
+                })
+                render_table(hc_df, hide_index=True, use_container_width=True)
+
+        # ── System risk contribution ──────────────────────────────────────────────
+        st.subheader("Who Actually Drives Portfolio Risk?")
+        rc_rows = []
+        rc_pct = risk_stats.get("rc_pct", pd.Series(dtype=float))
+        vols = risk_stats.get("vols", pd.Series(dtype=float))
+        components = risk_stats.get("component", pd.Series(dtype=float))
+        for stem in rc_pct.sort_values(ascending=False).index:
+            rc_rows.append({
+                "System": systems.get(stem, {}).get("display_name", stem)[:38],
+                "Contract": systems.get(stem, {}).get("contract_label", ""),
+                "Daily Vol": vols.get(stem, np.nan),
+                "Risk Contribution": components.get(stem, np.nan),
+                "Risk %": rc_pct.get(stem, np.nan),
+                "Avg ρ": corr_mat.loc[stem].drop(labels=[stem], errors="ignore").mean(),
+            })
+        if rc_rows:
+            render_table(pd.DataFrame(rc_rows), hide_index=True, use_container_width=True,
+                         height=min(42 + 36 * len(rc_rows), 620))
+
+        # ── Correlation clusters ──────────────────────────────────────────────────
+        st.subheader("Correlation Clusters")
+        cluster_rows = []
+        for cl in sorted(set(cluster_labels.values())):
+            members = [s for s, label in cluster_labels.items() if label == cl]
+            cluster_rc = float(rc_pct.reindex(members).fillna(0).sum())
+            cluster_vol = float(components.reindex(members).fillna(0).sum())
+            pair_vals = []
+            for i, a in enumerate(members):
+                for b in members[i + 1:]:
+                    v = corr_mat.loc[a, b]
+                    if np.isfinite(v):
+                        pair_vals.append(float(v))
+            cluster_rows.append({
+                "Cluster": f"Cluster {cl}",
+                "Systems": len(members),
+                "Avg Within-Cluster ρ": np.mean(pair_vals) if pair_vals else np.nan,
+                "Risk Contribution": cluster_vol,
+                "Risk %": cluster_rc,
+                "Members": ", ".join(systems.get(m, {}).get("display_name", m)[:24] for m in members),
+            })
+        if cluster_rows:
+            cluster_df = pd.DataFrame(cluster_rows).sort_values("Risk %", ascending=False)
+            render_table(cluster_df, hide_index=True, use_container_width=True)
+
+        with st.expander("ℹ️ How to read this", expanded=False):
+            st.markdown(
+                "**Daily Vol** measures each system on its own. **Risk Contribution** measures how much "
+                "that system contributes to the combined portfolio after correlations. A system can have "
+                "high standalone volatility but modest portfolio contribution if it diversifies the book — "
+                "and the reverse is also true. Clusters show when several different strategies are effectively "
+                "taking the same risk. This is the bridge to correlation-aware Risk Parity.")
+
+        # ── Rolling diversification diagnostic ────────────────────────────────────
+        with st.expander("📈 Rolling Correlation Diagnostic", expanded=False):
+            roll_days = st.selectbox("Rolling window", [21, 63, 126], index=1,
+                                     format_func=lambda x: {21: "1 month (21d)", 63: "3 months (63d)", 126: "6 months (126d)"}[x],
+                                     key="corr_roll_window")
+            if len(daily_r) >= roll_days + 5:
+                roll_corr = daily_r.rolling(roll_days).corr()
+                # Average off-diagonal correlation at each date.
+                vals = []
+                dates = []
+                cols = daily_r.columns.tolist()
+                for dt in daily_r.index:
+                    try:
+                        mat = roll_corr.loc[dt]
+                    except KeyError:
+                        continue
+                    arr = mat.values.astype(float)
+                    mask = np.triu(np.ones(arr.shape, dtype=bool), k=1)
+                    x = arr[mask]
+                    x = x[np.isfinite(x)]
+                    if len(x):
+                        vals.append(float(x.mean())); dates.append(dt)
+                if vals:
+                    fig_roll = go.Figure(go.Scatter(x=dates, y=vals, mode="lines", name="Avg ρ"))
+                    fig_roll.add_hline(y=over_exp_thresh, line_dash="dash",
+                                       line_color=C["red"], opacity=0.6,
+                                       annotation_text=f"Threshold {over_exp_thresh:.2f}")
+                    fig_roll.update_layout(template=THEME, height=300,
+                                           margin=dict(l=0, r=0, t=10, b=0),
+                                           yaxis_title="Average pairwise ρ",
+                                           yaxis=dict(range=[-1, 1]))
+                    st.plotly_chart(fig_roll, use_container_width=True, key="chart_corr_rolling")
+                    metric_with_help(st, "Rolling Avg ρ", f"{vals[-1]:.2f}")
+                else:
+                    st.info("Not enough overlapping observations for the selected rolling window.")
+            else:
+                st.info("Not enough overlapping observations for the selected rolling window.")
+
+        st.divider()
+
+        # ── Correlation-aware Risk Parity ─────────────────────────────────────────
+        st.subheader("🧠 Correlation-Aware Risk Parity")
+        st.info(
+            "**This is the next-generation Risk Parity.** It does not just equalise standalone volatility. "
+            "It aims to equalise each system’s **contribution to total portfolio volatility**, including correlations.\n\n"
+            "- **Volatility-only RP:** how risky is each system by itself?\n"
+            "- **Correlation-aware RP:** how much risk does each system add to the whole book?\n"
+            "- The result is scaled toward your target annualized portfolio risk and rounded to whole contracts.\n\n"
+            "Two highly correlated systems may therefore receive less combined exposure than two independent systems."
+        )
+        _unit_daily = pd.DataFrame(index=daily_r.index)
+        for stem in daily_r.columns:
+            cur_n = st.session_state["sizing"].get(stem, systems[stem]["default_n"])
+            # daily_r is already at current contract sizing; convert directly to one contract.
+            _unit_daily[stem] = daily_r[stem] / cur_n if cur_n > 0 else np.nan
+        _carp = compute_correlation_aware_rp(_unit_daily, account_balance, target_annual_risk, rp_max_ct)
+        if _carp:
+            _carp_n, _carp_rc = _carp["integer"], _carp["risk_pct"]
+            _carp_vol, _carp_target = _carp["portfolio_vol"], _carp["target_daily"]
+            _carp_ann = _carp_vol * np.sqrt(252) / account_balance if account_balance > 0 else 0.0
+            cc = st.columns(5)
+            metric_with_help(cc[0], "Target annual risk", f"{target_annual_risk:.0f}%")
+            metric_with_help(cc[1], "Target daily risk", f"${_carp_target:,.0f}")
+            metric_with_help(cc[2], "Correlation-aware RP Daily Risk", f"${_carp_vol:,.0f}")
+            metric_with_help(cc[3], "Resulting annual risk", f"{_carp_ann:.1%}")
+            metric_with_help(cc[4], "LW shrinkage", f"{_carp.get('shrinkage_intensity', np.nan):.1%}" if np.isfinite(_carp.get('shrinkage_intensity', np.nan)) else "n/a")
+            rows=[]
+            for stem in _carp_n.index:
+                cur=st.session_state["sizing"].get(stem, systems[stem]["default_n"]); adv=int(_carp_n[stem])
+                rows.append({"System":systems[stem]["display_name"][:38],"Contract":systems[stem]["contract_label"],
+                             "Current N":cur,"Correlation-Aware RP N":adv,"Change":adv-cur,
+                             "Unit Daily Vol":_carp["unit_vol"].get(stem,np.nan),"Risk %":_carp_rc.get(stem,np.nan)})
+            render_table(pd.DataFrame(rows).sort_values("Risk %",ascending=False), hide_index=True, use_container_width=True, height=min(42+36*len(rows),620))
+            with st.expander("ℹ️ How to read this", expanded=False):
+                st.markdown("**The goal is not equal contracts.** The goal is more balanced **portfolio risk contribution**.\n\n"
+                            "A system can have high standalone volatility but deserve more contracts if it diversifies the book. Conversely, a highly correlated system may deserve fewer contracts.\n\n"
+                            "Because futures use whole contracts, the final integer allocation will not be perfectly equal-risk.")
+        else:
+            st.warning("Not enough valid covariance data to calculate correlation-aware Risk Parity.")
+
+        st.divider()
+
+        # ── Risk Parity ───────────────────────────────────────────────────────────
+        st.subheader("⚖️ Risk Parity Sizing (Advisory)")
+        st.info(
+            "**What this section does:** it tries to give each system roughly the same *standalone* amount of daily P&L risk.\n\n"
+            "For example, if one system moves about $250/day and another moves about $1,000/day, the first can receive more contracts and the second fewer contracts.\n\n"
+            "**What it does NOT do yet:** it does not fully account for the fact that two systems may be highly correlated. Two systems can each have $500 of standalone risk and still create much more than $500 of combined portfolio risk if they tend to move together.\n\n"
+            "**That is the next step:** correlation-aware Risk Parity will size the systems based on their contribution to the *whole portfolio*, not just their individual volatility.")
+        st.caption(
+            f"A sizing reference that answers: **how many contracts would target about ${rp_target:,.0f} of one-day P&L volatility per system?** "
+            "It uses historical daily P&L volatility and is independent of the current Tab 1 sizing. "
+            "It is not a margin requirement, stop-loss, or maximum-loss estimate. **v25.1 keeps the volatility-only RP as a benchmark and adds the correlation-aware advisory below.**")
+
+        _rp_engine = portfolio_risk(systems, _active_stems, _current_sizing_map, lookback, window_days=126, min_overlap_days=252)
+        _tab2_sig = st.session_state.get("_canonical_tab2_risk")
+        if _tab2_sig and _tab2_sig.get("systems") == tuple(sorted(_active_stems)):
+            _risk_diff = abs(float(_tab2_sig.get("vol", 0.0)) - float(_rp_engine.get("portfolio_daily_vol", 0.0)))
+            if _risk_diff > 0.01:
+                st.warning(f"⚠️ Canonical risk consistency check failed: Tab 2 vs Tab 3 current daily risk differ by ${_risk_diff:,.2f} for the same system set/window.")
+            else:
+                st.caption("✅ Canonical risk check: Tab 2 and Tab 3 current daily risk agree for the same system set/window.")
+        elif _tab2_sig:
+            st.caption("ℹ️ Canonical risk check: Tab 2 is filtered to a different system set, so its current-risk figure is intentionally different from the all-active Tab 3 figure.")
+        _rp_current_risk = {stem: float(_rp_engine.get("vols", pd.Series()).get(stem, 0.0)) for stem in _active_stems}
+        _rp_total_risk = float(_rp_engine.get("portfolio_daily_vol", 0.0))
+        _rp_sum_individual_risk = float(_rp_engine.get("sum_individual_vol", 0.0))
+        _advisory_sizing_map = {stem: int(_rp_sizing.get(stem, 0)) for stem in _active_stems}
+        _rp_advisory_engine = portfolio_risk(systems, _active_stems, _advisory_sizing_map, lookback, min_overlap_days=252)
+        _rp_advisory_risk = float(_rp_advisory_engine.get("portfolio_daily_vol", 0.0))
+        _rp_current_risk_pct = _rp_total_risk / account_balance if account_balance > 0 else 0.0
+        _rp_advisory_risk_pct = _rp_advisory_risk / account_balance if account_balance > 0 else 0.0
+        _rp_current_ann_pct = _rp_total_risk * np.sqrt(252) / account_balance if account_balance > 0 else 0.0
+        _rp_advisory_ann_pct = _rp_advisory_risk * np.sqrt(252) / account_balance if account_balance > 0 else 0.0
+        rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+        metric_with_help(rc1, "Current daily risk", f"${_rp_total_risk:,.0f}",
+                   help="""**Formula:** standard deviation of combined daily portfolio P&L at the current contract sizes, including correlations.
+
+    **Purpose:** measure actual diversified portfolio volatility.
+
+    **In plain English:** how much does the whole book normally wobble by?
+
+    - The sum of standalone volatilities is shown separately; it deliberately gives no diversification credit.""")
+        metric_with_help(rc2, "Current risk / equity", f"{_rp_current_risk_pct:.2%}")
+        metric_with_help(rc3, "RP advisory daily risk", f"${_rp_advisory_risk:,.0f}",
+                   help="Estimated daily P&L volatility if the advisory contract counts were used.")
+        metric_with_help(rc4, "RP risk / equity", f"{_rp_advisory_risk_pct:.2%}")
+        metric_with_help(rc5, "Current → RP annual risk", f"{_rp_current_ann_pct:.0%} → {_rp_advisory_ann_pct:.0%}",
+                   help="Annualized P&L volatility divided by the account balance. This is a risk-leverage proxy, not notional futures leverage.")
+        st.caption(f"Standalone-volatility sum: **${_rp_sum_individual_risk:,.0f}/day**. This is deliberately not used as portfolio risk because it gives the systems no diversification credit.")
+
+        st.caption(
+            f"With a **${account_balance:,.0f}** account, current sizing implies about "
+            f"**{_rp_current_ann_pct:.0%} annualized P&L volatility**; the RP advisory sizing "
+            f"implies about **{_rp_advisory_ann_pct:.0%}**. In banker dialect: current book is "
+            f"running at {(_rp_current_ann_pct/_rp_advisory_ann_pct if _rp_advisory_ann_pct else 0):.1f}× "
+            "the advisory risk budget. Notional leverage and margin leverage are deliberately "
+            "not inferred here.")
+
+        rp_rows = []
+        for stem in _active_stems:
+            si = systems[stem]
+            d  = _rp_detail.get(stem, {})
+            rp_rows.append({
+                "System":        si["display_name"][:35],
+                "Symbol":        si["symbol"],
+                "Contract":      si["contract_label"],
+                "Vol / contract / day": d.get("vol_1ct", 0),
+                "Current Daily Risk": d.get("vol_1ct", 0) * st.session_state["sizing"].get(stem, si["default_n"]),
+                "RP Advisory N": _rp_sizing.get(stem, si["default_n"]),
+                "Current N":     st.session_state["sizing"].get(stem, si["default_n"]),
+                "Risk / Equity": (d.get("vol_1ct", 0) * st.session_state["sizing"].get(stem, si["default_n"]) / account_balance),
+                "Advisory Risk / Equity": (d.get("vol_1ct", 0) * _rp_sizing.get(stem, si["default_n"]) / account_balance),
+                "Action": (
+                    (lambda cur, adv: f"Increase +{adv-cur}" if adv > cur else (f"Reduce {adv-cur}" if adv < cur else "Maintain"))
+                    (st.session_state["sizing"].get(stem, si["default_n"]), _rp_sizing.get(stem, si["default_n"]))
+                ),
+            })
+        rp_df = pd.DataFrame(rp_rows)
+        render_table(
+            rp_df,
+            hide_index=True, use_container_width=True)
+        st.caption(
+            "**Action** shows the exact contract change required: **Increase +2**, **Reduce -1**, "
+            "or **Maintain**. Implementing all rows is simulated in the Portfolio Impact section below "
+            "before you change anything in the Systems tab.")
+
+        # ── Portfolio impact of implementing the full advisory sizing ────────────
+        st.subheader("📈 Portfolio Impact — If You Implemented All RP Changes")
+        st.caption(
+            "A before/after view using the same systems and date window. It shows what the portfolio "
+            "would have looked like if every Action above had been implemented simultaneously. "
+            "This is a historical sizing simulation, not a forecast or a margin calculation.")
+
+        advisory_curves = {}
+        for stem in _active_stems:
+            si = systems[stem]
+            adv_n = _rp_sizing.get(stem, si["default_n"])
+            if si["default_n"] <= 0 or adv_n <= 0:
+                continue
+            adv_ratio = adv_n / si["default_n"]
+            adv_eq = get_net_equity_trimmed(si, lookback, adv_ratio)
+            if not adv_eq.empty:
+                advisory_curves[stem] = adv_eq
+
+        if advisory_curves:
+            adv_df = combine_equity_curves(advisory_curves, lookback_years=lookback)
+            adv_df = filter_equity_by_date_range(adv_df, start_date, end_date)
+            if not adv_df.empty:
+                adv_df = adv_df - adv_df.iloc[0]
+                advisory_eq = adv_df.sum(axis=1)
+                advisory_pm = compute_portfolio_metrics(advisory_eq)
+                _impact_current_sizing = {stem: st.session_state["sizing"].get(stem, systems[stem]["default_n"]) for stem in selected_systems}
+                _impact_advisory_sizing = {stem: int(_rp_sizing.get(stem, _impact_current_sizing[stem])) for stem in _impact_current_sizing}
+                _impact_current = portfolio_risk(systems, selected_systems, _impact_current_sizing, lookback, date_start=start_date, date_end=end_date, min_overlap_days=252)
+                _impact_advisory = portfolio_risk(systems, selected_systems, _impact_advisory_sizing, lookback, date_start=start_date, date_end=end_date, min_overlap_days=252)
+                current_daily = float(_impact_current.get("portfolio_daily_vol", 0.0))
+                advisory_daily = float(_impact_advisory.get("portfolio_daily_vol", 0.0))
+                current_ann_risk_pct = current_daily * np.sqrt(252) / account_balance if account_balance > 0 else 0
+                advisory_ann_risk_pct = advisory_daily * np.sqrt(252) / account_balance if account_balance > 0 else 0
+
+                impact_rows = [
+                    {"Metric": "Account balance", "Current sizing": account_balance, "RP advisory sizing": account_balance, "Change": 0.0},
+                    {"Metric": "Net P&L", "Current sizing": pm.get("Net Profit ($)", 0), "RP advisory sizing": advisory_pm.get("Net Profit ($)", 0), "Change": advisory_pm.get("Net Profit ($)", 0) - pm.get("Net Profit ($)", 0)},
+                    {"Metric": "Max Drawdown", "Current sizing": pm.get("Max Drawdown ($)", 0), "RP advisory sizing": advisory_pm.get("Max Drawdown ($)", 0), "Change": advisory_pm.get("Max Drawdown ($)", 0) - pm.get("Max Drawdown ($)", 0)},
+                    {"Metric": "Daily P&L risk", "Current sizing": current_daily, "RP advisory sizing": advisory_daily, "Change": advisory_daily - current_daily},
+                    {"Metric": "Annualized risk / equity", "Current sizing": current_ann_risk_pct, "RP advisory sizing": advisory_ann_risk_pct, "Change": advisory_ann_risk_pct - current_ann_risk_pct},
+                    {"Metric": "P&L Sharpe", "Current sizing": pm.get("P&L Sharpe", 0), "RP advisory sizing": advisory_pm.get("P&L Sharpe", 0), "Change": advisory_pm.get("P&L Sharpe", 0) - pm.get("P&L Sharpe", 0)},
+                    {"Metric": "Ann. P&L / Max DD", "Current sizing": pm.get("Ann. P&L / Max DD", 0), "RP advisory sizing": advisory_pm.get("Ann. P&L / Max DD", 0), "Change": advisory_pm.get("Ann. P&L / Max DD", 0) - pm.get("Ann. P&L / Max DD", 0)},
+                ]
+                # This comparison intentionally uses display strings because the same column
+                # contains dollars, percentages and ratios depending on the row.
+                def _impact_fmt(metric, value):
+                    if metric in {"Account balance", "Net P&L", "Max Drawdown", "Daily P&L risk"}:
+                        return _fmt_money(value)
+                    if metric == "Annualized risk / equity":
+                        return f"{value:.1%}"
+                    return f"{value:.2f}"
+
+                impact_display = pd.DataFrame([
+                    {
+                        "Metric": r["Metric"],
+                        "Current": _impact_fmt(r["Metric"], r["Current sizing"]),
+                        "RP Advisory": _impact_fmt(r["Metric"], r["RP advisory sizing"]),
+                        "Change": (
+                            (f"{r['Change']:+.1%}" if r["Metric"] == "Annualized risk / equity"
+                             else f"{r['Change']:+.2f}" if r["Metric"] in {"P&L Sharpe", "Ann. P&L / Max DD"}
+                             else _fmt_money(r["Change"]))
+                        ),
+                    }
+                    for r in impact_rows
+                ])
+                render_table(impact_display, hide_index=True, use_container_width=True)
+
+                imp1, imp2, imp3 = st.columns(3)
+                imp1.metric("Daily risk", f"${current_daily:,.0f} → ${advisory_daily:,.0f}",
+                             help="Historical one-day P&L volatility under current sizing versus the full Risk Parity Advisory sizing.")
+                imp2.metric("Annual risk / equity", f"{current_ann_risk_pct:.1%} → {advisory_ann_risk_pct:.1%}",
+                             help="Annualized P&L volatility divided by account balance, comparing current and advisory sizing.")
+                risk_change = advisory_ann_risk_pct - current_ann_risk_pct
+                imp3.metric("Risk change", f"{risk_change:+.1%}",
+                             help="Change in annualized portfolio risk relative to account equity if all advisory sizing changes were implemented.")
+
+        st.divider()
+
+        # ── Recommended Sub-Portfolios ────────────────────────────────────────────
+        st.subheader("🎯 Recommended Sub-Portfolios")
+        st.caption("Subsets selected by different risk/return criteria.")
+
+        reccos = recommend_portfolios(corr_df, systems)
+        for rec_i, rec in enumerate(reccos):
+            with st.expander(f"{rec['name']} — {rec['description']}"):
+                rec_stems = [s for s in rec["systems"] if s in all_curves]
+                if not rec_stems:
+                    st.write("Insufficient data.")
+                    continue
+                ratios_rec = {s: _cur_ratio(s) for s in rec_stems}
+                rec_eq     = build_portfolio_equity(systems, rec_stems, lookback, ratios_rec)
+                rec_m      = compute_portfolio_metrics(rec_eq)
+                mc4 = st.columns(4)
+                for col, (lbl, key, fmt) in zip(mc4, [
+                    ("Net P&L", "Net Profit ($)", "$"), ("P&L Sharpe", "P&L Sharpe", "f"),
+                    ("Max DD",  "Max Drawdown ($)", "$"), ("Ann. P&L / DD", "Ann. P&L / Max DD", "f"),
+                ]):
+                    v = rec_m.get(key, 0)
+                    metric_with_help(col, lbl, f"${v:,.0f}" if fmt == "$" else f"{v:.2f}")
+                if not rec_eq.empty:
+                    norm = rec_eq - rec_eq.iloc[0]
+                    fig_r = go.Figure(go.Scatter(x=norm.index, y=norm.values,
+                                                  line=dict(color=C["blue"], width=2)))
+                    fig_r.update_layout(template=THEME, height=320,
+                                         margin=dict(l=0, r=0, t=10, b=0),
+                                         yaxis_title="Cum. P&L ($)")
+                    st.plotly_chart(fig_r, use_container_width=True, key=f"chart_4_{rec_i}")
+
+        st.divider()
+
+        # ── Risk / Return scatter ─────────────────────────────────────────────────
+        st.subheader("Risk / Return Scatter")
+        scatter_rows = []
+        for stem in corr_df.columns:
+            d   = daily_r[stem]
+            col = corr_df[stem]
+            net   = col.iloc[-1] - col.iloc[0]
+            n_yr  = max((col.index[-1] - col.index[0]).days / 365.25, 0.01)
+            ann_r = net / n_yr
+            sharpe_v = (d.mean() / d.std() * np.sqrt(252)) if d.std() > 0 else 0
+            max_dd_v = (col - col.cummax()).min()
+            scatter_rows.append({
+                "System":         systems.get(stem, {}).get("display_name", stem)[:32],
+                "Symbol":         systems.get(stem, {}).get("symbol", ""),
+                "Sharpe":         round(float(sharpe_v), 2),
+                "Max DD ($)":     round(float(max_dd_v), 0),
+                "Ann Return ($)": round(float(ann_r), 0),
+                "_sz":            max(abs(float(ann_r)), 1.0),
+            })
+        if scatter_rows:
+            sc_df  = pd.DataFrame(scatter_rows)
+            fig_sc = px.scatter(sc_df, x="Max DD ($)", y="Sharpe",
+                                text="System", color="Symbol",
+                                size="_sz", size_max=42, template=THEME,
+                                title="P&L Sharpe vs Max Drawdown  (bubble = |Ann. P&L|)",
+                                hover_data={"Ann Return ($)": True, "_sz": False})
+            fig_sc.update_traces(textposition="top center")
+            fig_sc.update_layout(height=520, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig_sc, use_container_width=True, key="chart_5")
+
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # TAB 4 — FORWARD ANALYSIS
+    # ═════════════════════════════════════════════════════════════════════════════
+
+_render_tab3()
 
 with tab4:
 
@@ -1965,7 +3384,8 @@ with tab4:
         if hdf.empty:
             health_rows.append({
                 "System": si["display_name"][:35], "Status": "⚪",
-                "Sharpe": "—", "PF": "—", "Win %": "—", "Period P&L": "—"})
+                "Sharpe": np.nan, "PF": np.nan, "Win %": np.nan,
+                "Period P&L": np.nan})
             continue
         health_charts[stem] = hdf
         lt = hdf.iloc[-1]
@@ -1973,15 +3393,23 @@ with tab4:
         health_rows.append({
             "System":     si["display_name"][:35],
             "Status":     tl,
-            "Sharpe":     f'{lt["Sharpe"]:.2f}',
-            "PF":         f'{lt["Profit Factor"]:.2f}',
-            "Win %":      f'{lt["Win Rate"]*100:.1f}%',
-            "Period P&L": f'${lt["Period P&L"]:,.0f}',
+            "Sharpe":     lt["Sharpe"],
+            "PF":         lt["Profit Factor"],
+            "Win %":      lt["Win Rate"],
+            "Period P&L": lt["Period P&L"],
         })
 
-    st.dataframe(pd.DataFrame(health_rows), hide_index=True,
-                 use_container_width=True,
-                 height=min(42 + 36 * len(health_rows), 520))
+    health_df = pd.DataFrame(health_rows)
+    # coerce numeric columns to preserve numeric sorting while formatting
+    for c in ["Sharpe", "PF", "Win %", "Period P&L", "# Trades"]:
+        if c in health_df.columns:
+            health_df[c] = pd.to_numeric(health_df[c], errors="coerce")
+
+    render_table(
+        health_df,
+        hide_index=True,
+        use_container_width=True,
+        height=min(42 + 36 * len(health_rows), 520))
 
     if health_charts:
         with st.expander("📈 Rolling Sharpe over time"):
@@ -2022,76 +3450,132 @@ with tab4:
     # ── Monte Carlo ───────────────────────────────────────────────────────────
     st.subheader("🎲 Monte Carlo Forward Projection")
     st.caption(
-        "Bootstrap resampling of historical daily net returns → confidence bands. "
-        "Uses current sizing from Tab 1.")
+        "Projects the current portfolio by resampling historical daily P&L. "
+        "The simulation is a scenario tool, not a forecast."
+    )
 
-    mc_c1, mc_c2 = st.columns(2)
+    mc_info = st.expander("ℹ️ How to read this", expanded=False)
+    with mc_info:
+        st.markdown(
+            "**What it does**\n\n"
+            "- Takes the historical **portfolio daily P&L** at your current sizing.\n"
+            "- Randomly rearranges historical observations to create many possible futures.\n"
+            "- Reports the distribution of possible P&L and drawdowns.\n\n"
+            "**Why the block bootstrap matters**\n\n"
+            "- **IID bootstrap** treats every day as independent.\n"
+            "- **Block bootstrap** keeps short runs of consecutive days together, "
+            "which better preserves streaks and volatility clustering.\n\n"
+            "**Important:** Monte Carlo does not know what the market will do next. "
+            "It asks: *if the future behaves broadly like the selected historical sample, "
+            "what range of outcomes is plausible?*"
+        )
+
+    mc_c1, mc_c2, mc_c3 = st.columns(3)
     with mc_c1:
-        mc_sims = st.selectbox("Simulations", [500, 1000, 2000, 5000], index=1)
+        mc_sims = st.selectbox("Simulations", [500, 1000, 2000, 5000], index=1,
+                               key="mc_sims_v24")
     with mc_c2:
         mc_days_opt = st.selectbox(
             "Horizon", [63, 126, 252],
             format_func=lambda x: {63: "3 months", 126: "6 months", 252: "12 months"}[x],
-            index=1)
+            index=1, key="mc_days_v24")
+    with mc_c3:
+        mc_method = st.selectbox(
+            "Method",
+            ["Regime-conditioned bootstrap", "Block bootstrap", "IID bootstrap"],
+            index=0, key="mc_method_v25")
 
-    if st.button("🎲 Run Monte Carlo", type="primary", key="run_mc"):
+    mc_block_days = 5
+    if mc_method == "Block bootstrap":
+        mc_block_days = st.selectbox(
+            "Block length", [3, 5, 10, 20], index=1,
+            format_func=lambda x: f"{x} trading days", key="mc_block_v25")
+
+    mc_regime_window, mc_low_pct, mc_high_pct = 20, 33, 66
+    if mc_method == "Regime-conditioned bootstrap":
+        rc1, rc2, rc3 = st.columns(3)
+        with rc1:
+            mc_regime_window = st.selectbox("Regime vol window", [10, 15, 20, 30, 40], index=2, key="mc_regime_window_v25")
+        with rc2:
+            mc_low_pct = st.slider("Low-vol percentile", 20, 45, 33, key="mc_low_pct_v25")
+        with rc3:
+            mc_high_pct = st.slider("High-vol percentile", 55, 80, 66, key="mc_high_pct_v25")
+        st.caption(
+            "**Regime-conditioned bootstrap:** first simulates whether the portfolio stays in Low / Medium / High Vol, "
+            "then samples historical daily P&L from that regime. This captures volatility-state persistence; it does not predict the future.")
+
+    if st.button("🎲 Run Monte Carlo", type="primary", key="run_mc_v25"):
         with st.spinner(f"Running {mc_sims:,} simulations…"):
             ratios_mc = {s: _cur_ratio(s) for s in _active_stems}
             mc_res = monte_carlo_simulation(
                 systems, _active_stems, lookback,
                 n_sims=mc_sims, forward_days=mc_days_opt,
-                sizing_ratios=ratios_mc)
+                sizing_ratios=ratios_mc,
+                method=mc_method, block_days=mc_block_days,
+                regime_window=mc_regime_window, low_pct=mc_low_pct, high_pct=mc_high_pct,
+                account_balance=account_balance)
 
         if mc_res is None:
-            st.warning("Not enough data.")
+            st.warning("Not enough valid historical portfolio data for the selected lookback.")
         else:
-            pct     = mc_res["percentiles"]
-            days_x  = list(range(len(pct)))
-            hor_lbl = {63: "3 months", 126: "6 months",
-                       252: "12 months"}.get(mc_days_opt, "")
+            pct = mc_res["percentiles"]
+            days_x = list(range(1, len(pct) + 1))
+            hor_lbl = {63: "3 months", 126: "6 months", 252: "12 months"}.get(mc_days_opt, "")
 
             fig_mc = go.Figure()
             fig_mc.add_trace(go.Scatter(x=days_x, y=pct["95th"].values,
-                                         mode="lines", line=dict(width=0),
-                                         showlegend=False))
+                                        mode="lines", line=dict(width=0), showlegend=False))
             fig_mc.add_trace(go.Scatter(x=days_x, y=pct["5th"].values,
-                                         mode="lines", line=dict(width=0),
-                                         fill="tonexty",
-                                         fillcolor="rgba(38,139,210,0.12)",
-                                         name="5-95th pct"))
+                                        mode="lines", line=dict(width=0), fill="tonexty",
+                                        fillcolor="rgba(38,139,210,0.12)", name="5–95th pct"))
             fig_mc.add_trace(go.Scatter(x=days_x, y=pct["75th"].values,
-                                         mode="lines", line=dict(width=0),
-                                         showlegend=False))
+                                        mode="lines", line=dict(width=0), showlegend=False))
             fig_mc.add_trace(go.Scatter(x=days_x, y=pct["25th"].values,
-                                         mode="lines", line=dict(width=0),
-                                         fill="tonexty",
-                                         fillcolor="rgba(38,139,210,0.22)",
-                                         name="25-75th pct"))
+                                        mode="lines", line=dict(width=0), fill="tonexty",
+                                        fillcolor="rgba(38,139,210,0.22)", name="25–75th pct"))
             fig_mc.add_trace(go.Scatter(x=days_x, y=pct["50th"].values,
-                                         name="Median",
-                                         line=dict(color=C["blue"], width=2.5)))
+                                        name="Median", line=dict(color=C["blue"], width=2.5)))
             fig_mc.add_hline(y=0, line_dash="dot", line_color=C["zero_line"])
             fig_mc.update_layout(template=THEME, height=450,
-                                  margin=dict(l=0, r=0, t=30, b=0),
-                                  title=f"Monte Carlo: {mc_sims:,} × {hor_lbl}",
-                                  xaxis_title="Trading Days Forward",
-                                  yaxis_title="Projected P&L ($)")
-            st.plotly_chart(fig_mc, use_container_width=True, key="chart_8")
+                                 margin=dict(l=0, r=0, t=30, b=0),
+                                 title=f"Monte Carlo: {mc_sims:,} × {hor_lbl} — {mc_method}",
+                                 xaxis_title="Trading Days Forward",
+                                 yaxis_title="Projected P&L ($)")
+            st.plotly_chart(fig_mc, use_container_width=True, key="chart_mc_v25")
 
             final = mc_res["paths"].iloc[-1]
-            ec    = st.columns(5)
-            ec[0].metric("Median",  f"${final.median():,.0f}")
-            ec[1].metric("Mean",    f"${final.mean():,.0f}")
-            ec[2].metric("5th pct", f"${final.quantile(0.05):,.0f}")
-            ec[3].metric("95th",    f"${final.quantile(0.95):,.0f}")
-            ec[4].metric("P(loss)", f"{(final < 0).mean():.1%}")
+            ec = st.columns(7)
+            metric_with_help(ec[0], "Median", f"${final.median():,.0f}")
+            metric_with_help(ec[1], "Mean", f"${final.mean():,.0f}")
+            metric_with_help(ec[2], "5th pct", f"${final.quantile(0.05):,.0f}")
+            metric_with_help(ec[3], "95th", f"${final.quantile(0.95):,.0f}")
+            metric_with_help(ec[4], "P(loss)", f"{(final < 0).mean():.1%}")
+            metric_with_help(ec[5], "5% Terminal ES", f"${mc_res['terminal_es_5']:,.0f}")
+            metric_with_help(ec[6], "Historical days", f"{mc_res['historical_days']:,}")
 
-            dd_rows = [{"DD Threshold": f"${t:,.0f}",
-                        "Probability":  f"{p:.1%}",
-                        "Bar": "█" * int(p * 30)}
-                       for t, p in sorted(mc_res["dd_probs"].items())]
-            st.dataframe(pd.DataFrame(dd_rows), hide_index=True,
+            if mc_method == "Regime-conditioned bootstrap" and "current_regime" in mc_res:
+                st.markdown("**Starting volatility regime**")
+                rg1, rg2 = st.columns(2)
+                metric_with_help(rg1, "Current Vol Regime", mc_res["current_regime"])
+                metric_with_help(rg2, "Regime Persistence", f"{mc_res['regime_persistence']:.1%}")
+
+            st.markdown("**Maximum drawdown probabilities**")
+            dd_rows = [{
+                "Drawdown Threshold": f"{t:.1%} of account",
+                "Probability": p,
+                "Dollar Threshold": account_balance * t,
+            } for t, p in sorted(mc_res["dd_probs"].items())]
+            render_table(pd.DataFrame(dd_rows), hide_index=True,
                          use_container_width=True)
+
+            st.caption(
+                f"Simulation: **{mc_method}**; "
+                f"{mc_res['historical_days']:,} historical daily observations; "
+                f"{mc_sims:,} paths × {hor_lbl}. "
+                "Block bootstrap preserves short sequences of historical days. "
+                "Regime-conditioned bootstrap also models empirical volatility-regime persistence. "
+                "Neither method predicts future regimes."
+            )
 
     st.divider()
 
@@ -2099,45 +3583,95 @@ with tab4:
     st.subheader("📋 Sizing Recommendation Summary")
     st.caption("Based on rolling health metrics (3-month window). Not financial advice.")
 
+    portfolio_exposure = {
+        stem: abs(eq_df[stem].iloc[-1]) if stem in eq_df.columns else 0.0
+        for stem in _active_stems
+    }
+    exposure_sum = sum(portfolio_exposure.values()) or 1.0
+    avg_corr = pd.Series({
+        stem: (corr_df.loc[stem, _active_stems].drop(labels=[stem], errors='ignore').mean()
+               if stem in corr_df.index else np.nan)
+        for stem in _active_stems
+    })
+    regime_df, _ = compute_regime_series({stem: eq_df[stem] for stem in _active_stems if stem in eq_df},
+                                         vol_window=20, low_pct=33, high_pct=66)
+    cur_regime = regime_df["regime"].iloc[-1] if not regime_df.empty else "Unknown"
+
     rec_rows = []
     for stem in _active_stems:
         si  = systems[stem]
         nd  = si["default_n"]
         hdf = compute_rolling_health(si["trades"], si["comm_per_trade"], 63)
         cur_n = st.session_state["sizing"].get(stem, nd)
+        weight = portfolio_exposure.get(stem, 0.0) / exposure_sum
+        corr  = avg_corr.get(stem, np.nan)
 
         if hdf.empty:
             rec_rows.append({
-                "System":   si["display_name"][:35],
-                "Contract": si["contract_label"],
-                "Current N": cur_n,
-                "Health":   "⚪ No data",
-                "Suggestion": "Insufficient data"})
+                "System":        si["display_name"][:35],
+                "Contract":      si["contract_label"],
+                "Current N":     cur_n,
+                "Suggested N":   cur_n,
+                "Scale":         "1.0x",
+                "Weight":        weight,
+                "Avg Corr":      corr,
+                "Health":        "⚪ No data",
+                "Suggestion":     "Insufficient data",
+                "Portfolio Regime": cur_regime,
+            })
             continue
 
         lt  = hdf.iloc[-1]
         sh, pf_v, wr = lt["Sharpe"], lt["Profit Factor"], lt["Win Rate"]
         tl  = health_traffic_light(sh, pf_v, wr)
-        if tl == "🟢":
-            sugg = ("Scale up — strong momentum" if sh > 1.5 and pf_v > 1.5
-                    else "Maintain — performing well")
-        elif tl == "🟡":
-            sugg = "Monitor — consider reducing if trend continues"
-        else:
-            sugg = "Consider reducing or pausing" if sh < -0.5 else "Consider reducing"
 
+        suggested_n = cur_n
+        if tl == "🟢":
+            if sh > 1.5 and pf_v > 1.5 and corr < 0.75 and cur_regime != "High Vol":
+                sugg = "Scale up — strong momentum + diversified"
+                suggested_n = max(cur_n + 1, int(np.ceil(cur_n * 1.2)))
+            else:
+                sugg = "Maintain — strong core holding"
+        elif tl == "🟡":
+            if weight > 0.20 or corr > 0.75 or cur_regime == "High Vol":
+                sugg = "Reduce exposure — watch portfolio concentration"
+                suggested_n = max(cur_n - 1, 1)
+            else:
+                sugg = "Hold — monitor correlation and regime"
+        else:
+            sugg = "Reduce or pause — weak health"
+            suggested_n = max(cur_n - 1, 1)
+
+        if cur_regime == "High Vol" and tl == "🟢":
+            sugg += " (volatility regime is high)"
+        if corr > 0.8:
+            sugg += " (high correlation to portfolio)"
+
+        scale_label = f"{suggested_n / cur_n:.1f}x" if cur_n else "—"
         rec_rows.append({
-            "System":     si["display_name"][:35],
-            "Contract":   si["contract_label"],
-            "Default N":  nd,
-            "Current N":  cur_n,
-            "Health":     f"{tl} Sh={sh:.1f} PF={pf_v:.1f}",
-            "Suggestion": sugg,
+            "System":        si["display_name"][:35],
+            "Contract":      si["contract_label"],
+            "Current N":     cur_n,
+            "Suggested N":   suggested_n,
+            "Scale":         scale_label,
+            "Weight":        weight,
+            "Avg Corr":      corr,
+            "Health":        f"{tl} Sh={sh:.1f} PF={pf_v:.1f}",
+            "Suggestion":     sugg,
+            "Portfolio Regime": cur_regime,
         })
 
-    st.dataframe(pd.DataFrame(rec_rows), hide_index=True,
-                 use_container_width=True,
-                 height=min(42 + 36 * len(rec_rows), 520))
+    rec_df = pd.DataFrame(rec_rows)
+    # coerce numeric columns so sorting works; display via Styler
+    for c in ["Current N", "Suggested N", "Weight", "Avg Corr"]:
+        if c in rec_df.columns:
+            rec_df[c] = pd.to_numeric(rec_df[c], errors="coerce")
+
+    render_table(
+        rec_df,
+        hide_index=True,
+        use_container_width=True,
+        height=min(42 + 36 * len(rec_rows), 520))
     st.info("⚠️ Suggestions based on rolling historical metrics. "
             "Not financial advice. Past performance ≠ future results.")
 
@@ -2242,15 +3776,21 @@ with tab4:
                         "System":    si["display_name"][:32],
                         "Regime":    rl,
                         "# Trades":  m["n_trades"],
-                        "Total P&L": f'${m["total_pnl"]:,.0f}',
-                        "Avg P&L":   f'${m["avg_pnl"]:,.0f}',
-                        "Win Rate":  f'{m["win_rate"]:.0%}',
-                        "PF":        f'{m["profit_factor"]:.2f}',
+                        "Total P&L": m["total_pnl"],
+                        "Avg P&L":   m["avg_pnl"],
+                        "Win Rate":  m["win_rate"],
+                        "PF":        m["profit_factor"],
                     })
             if rp_table:
-                st.dataframe(pd.DataFrame(rp_table), hide_index=True,
-                             use_container_width=True,
-                             height=min(42 + 36 * len(rp_table), 520))
+                rp_df = pd.DataFrame(rp_table)
+                for c in ["Total P&L", "Avg P&L", "Win Rate", "PF", "# Trades"]:
+                    if c in rp_df.columns:
+                        rp_df[c] = pd.to_numeric(rp_df[c], errors="coerce")
+
+                render_table(
+                    rp_df,
+                    hide_index=True, use_container_width=True,
+                    height=min(42 + 36 * len(rp_table), 520))
             st.info("💡 Systems robust across all regimes are the strongest core holdings.")
 
 
@@ -2411,20 +3951,18 @@ with tab5:
                         "Theoretical P&L / Unmatched Impact / Portfolio Totals. If one of these "
                         "is actually an active system (e.g. a rename ReadMe.txt hasn't caught "
                         "up with), add/fix its ReadMe.txt line and it'll be picked up normally.")
-                    st.dataframe(pd.DataFrame(excluded), hide_index=True, use_container_width=True)
+                    render_table(pd.DataFrame(excluded), hide_index=True, use_container_width=True)
 
             # ── Portfolio totals — the number that actually answers "where did
             # the money go", but ONLY once (most of) the 18 systems are loaded ──
             n_loaded = tsm_result.get("n_systems_loaded", 0)
             totals = tsm_result.get("portfolio_totals", {})
             st.subheader(f"💰 Portfolio Totals — {month_label}")
-            if n_loaded < 18:
+            expected_files = len(systems)
+            if n_loaded < expected_files:
                 st.warning(
-                    f"⚠️ Only **{n_loaded} of 18 systems** have a trade file loaded right now "
-                    f"(found in the Data directory). These totals only cover those "
-                    f"{n_loaded} — they will UNDERSTATE the full portfolio gap until all "
-                    f"18 systems have a .csv or .xlsx in place. Don't treat this as proof "
-                    f"of anything until it's complete.")
+                    f"⚠️ Only **{n_loaded} of {expected_files} loaded systems** have a trade file "
+                    f"available for the selected month. Missing files can understate the portfolio gap.")
             if not totals:
                 st.caption("No theoretical trades exited in this month for any loaded system.")
             else:
@@ -2515,7 +4053,7 @@ with tab5:
                         "the offset. 'Trusted' segments were tight enough to auto-match on; "
                         "untrusted ones are still offered as override-review candidates (never "
                         "silently auto-matched) rather than discarded.")
-                    st.dataframe(pd.DataFrame(off_rows), hide_index=True, use_container_width=True)
+                    render_table(pd.DataFrame(off_rows), hide_index=True, use_container_width=True)
 
             st.divider()
 
@@ -2525,7 +4063,7 @@ with tab5:
             if breakdown.empty:
                 st.info("No theoretical trades exited in this month for any loaded system.")
             else:
-                st.dataframe(breakdown, hide_index=True, use_container_width=True,
+                render_table(breakdown, hide_index=True, use_container_width=True,
                              height=min(42 + 36 * len(breakdown), 500))
 
                 fig_bd = go.Figure()
@@ -2574,8 +4112,19 @@ with tab5:
                                 "`high_slippage`). NQ/MNQ allow up to 13pts, ES/MES up to 4pts "
                                 "before this flag no longer applies at all and it falls to "
                                 "override review instead.")
-                    st.dataframe(matched.drop(columns=["theo_id"]), hide_index=True,
+                    render_table(matched.drop(columns=["theo_id"]), hide_index=True,
                                  use_container_width=True, height=min(42 + 36 * len(matched), 600))
+
+                    if _emp_slip is None:
+                        st.warning(f"⚠️ Empirical slippage module unavailable: {_EMP_SLIP_IMPORT_ERROR}")
+                    else:
+                        _slip_summary = _emp_slip.estimate_slippage_ticks(matched)
+                        st.subheader("📏 Empirical Slippage — Diagnostic")
+                        if _slip_summary.empty:
+                            st.warning("⚠️ No usable entry/exit slippage-tick fields were found in the matched sample. No slippage haircut is applied.")
+                        else:
+                            st.caption("Observed slippage is shown in ticks by contract root and strategy family. Dollar conversion and historical P&L haircuts are deliberately NOT applied until an explicit tick-value mapping is supplied; no placeholder market values are invented.")
+                            render_table(_slip_summary, hide_index=True, use_container_width=True)
 
             # ── Override candidates — interactive human review ──
             overrides = tsm_result["override_candidates"]
@@ -2639,9 +4188,9 @@ with tab5:
                                   .sort_values("n_trades", ascending=False).reset_index())
                         by_sys["total_theo_pnl"] = by_sys["total_theo_pnl"].round(2)
                         st.caption("By system (which ones are driving this count):")
-                        st.dataframe(by_sys, hide_index=True, use_container_width=True)
+                        render_table(by_sys, hide_index=True, use_container_width=True)
                         st.caption("Full list:")
-                        st.dataframe(
+                        render_table(
                             unmatched_theo[["system_name", "entry_date", "entry_price",
                                             "exit_date", "exit_price", "n_contracts", "pnl"]],
                             hide_index=True, use_container_width=True)
@@ -2687,7 +4236,7 @@ with tab5:
                                "theoretical trade claimed — extra/manual trades, or a "
                                "system not currently loaded.")
                     if not unmatched_actual.empty:
-                        st.dataframe(
+                        render_table(
                             unmatched_actual[["root", "side", "qty_filled", "price",
                                               "fill_time", "commission"]].sort_values("fill_time"),
                             hide_index=True, use_container_width=True, height=300)
@@ -2697,7 +4246,7 @@ with tab5:
                     st.caption("Symbols outside the 18 systems (e.g. RTY, HG/MHG) — shown "
                                "for visibility only, never matched.")
                     if not out_scope.empty:
-                        st.dataframe(
+                        render_table(
                             out_scope[["root", "side", "qty_filled", "price", "fill_time"]]
                             .sort_values("fill_time"),
                             hide_index=True, use_container_width=True, height=300)
@@ -2741,7 +4290,7 @@ with tab5:
                     "charges that never appear in that export. Trust `statement_fee` as the "
                     "real cost — it's what the sidebar's commission defaults are calibrated "
                     "from.")
-                st.dataframe(recon, hide_index=True, use_container_width=True)
+                render_table(recon, hide_index=True, use_container_width=True)
 
             st.divider()
             with st.expander("📜 Override log (all systems, all months)"):
@@ -2749,4 +4298,4 @@ with tab5:
                 if full_log.empty:
                     st.caption("No overrides saved yet.")
                 else:
-                    st.dataframe(full_log, hide_index=True, use_container_width=True)
+                    render_table(full_log, hide_index=True, use_container_width=True)

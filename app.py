@@ -3244,7 +3244,28 @@ def _render_tab3():
                 adv_df = adv_df - adv_df.iloc[0]
                 advisory_eq = adv_df.sum(axis=1)
                 advisory_pm = compute_portfolio_metrics(advisory_eq)
-                # Rebuild current-sizing metrics locally; Tab 3 must not depend on Tab 2's local `pm`.\n                current_curves = {}\n                for stem in selected_systems:\n                    si = systems[stem]\n                    default_n = float(si['default_n'])\n                    cur_n = float(st.session_state['sizing'].get(stem, si['default_n']))\n                    if default_n <= 0 or cur_n <= 0:\n                        continue\n                    cur_eq = get_net_equity_trimmed(si, lookback, cur_n / default_n)\n                    if not cur_eq.empty:\n                        current_curves[stem] = cur_eq\n                current_pm = {}\n                if current_curves:\n                    current_df = combine_equity_curves(current_curves, lookback_years=lookback)\n                    current_df = filter_equity_by_date_range(current_df, start_date, end_date)\n                    if not current_df.empty:\n                        current_df = current_df - current_df.iloc[0]\n                        current_pm = compute_portfolio_metrics(current_df.sum(axis=1))\n                _impact_current_sizing = {stem: st.session_state["sizing"].get(stem, systems[stem]["default_n"]) for stem in selected_systems}
+                # Rebuild current-sizing metrics locally; Tab 3 must not depend on Tab 2's local `pm`.
+                    stem: st.session_state["sizing"].get(stem, systems[stem]["default_n"])
+                    for stem in selected_systems
+                }
+                current_curves = {}
+                for stem in selected_systems:
+                    si = systems[stem]
+                    default_n = float(si["default_n"])
+                    cur_n = float(_impact_current_sizing[stem])
+                    if default_n <= 0 or cur_n <= 0:
+                        continue
+                    cur_eq = get_net_equity_trimmed(si, lookback, cur_n / default_n)
+                    if not cur_eq.empty:
+                        current_curves[stem] = cur_eq
+                current_pm = {}
+                if current_curves:
+                    current_df = combine_equity_curves(current_curves, lookback_years=lookback)
+                    current_df = filter_equity_by_date_range(current_df, start_date, end_date)
+                    if not current_df.empty:
+                        current_df = current_df - current_df.iloc[0]
+                        current_pm = compute_portfolio_metrics(current_df.sum(axis=1))
+                _impact_current_sizing = {stem: st.session_state["sizing"].get(stem, systems[stem]["default_n"]) for stem in selected_systems}
                 _impact_advisory_sizing = {stem: int(_rp_sizing.get(stem, _impact_current_sizing[stem])) for stem in _impact_current_sizing}
                 _impact_current = portfolio_risk(systems, selected_systems, _impact_current_sizing, lookback, date_start=start_date, date_end=end_date, min_overlap_days=252)
                 _impact_advisory = portfolio_risk(systems, selected_systems, _impact_advisory_sizing, lookback, date_start=start_date, date_end=end_date, min_overlap_days=252)

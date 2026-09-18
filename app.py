@@ -3244,15 +3244,12 @@ def _render_tab3():
                 adv_df = adv_df - adv_df.iloc[0]
                 advisory_eq = adv_df.sum(axis=1)
                 advisory_pm = compute_portfolio_metrics(advisory_eq)
-                # Rebuild current-sizing metrics locally; Tab 3 must not depend on Tab 2's local `pm`.
-                    stem: st.session_state["sizing"].get(stem, systems[stem]["default_n"])
-                    for stem in selected_systems
-                }
+                # Rebuild current-sizing metrics locally; Tab 3 must not depend on Tab 2's local pm.
                 current_curves = {}
                 for stem in selected_systems:
                     si = systems[stem]
                     default_n = float(si["default_n"])
-                    cur_n = float(_impact_current_sizing[stem])
+                    cur_n = float(st.session_state["sizing"].get(stem, si["default_n"]))
                     if default_n <= 0 or cur_n <= 0:
                         continue
                     cur_eq = get_net_equity_trimmed(si, lookback, cur_n / default_n)
@@ -3276,7 +3273,7 @@ def _render_tab3():
 
                 impact_rows = [
                     {"Metric": "Account balance", "Current sizing": account_balance, "RP advisory sizing": account_balance, "Change": 0.0},
-                    {"Metric": "Net P&L", "Current sizing": current_pm.get("Net Profit ($)", 0), "RP advisory sizing": advisory_pm.get("Net Profit ($)", 0), "Change": advisory_pm.get("Net Profit ($)", 0) - current_pm.get("Net Profit ($)", 0)},
+                    {"Metric": "Net P&L", "Current sizing": current_current_pm.get("Net Profit ($)", 0), "RP advisory sizing": advisory_pm.get("Net Profit ($)", 0), "Change": advisory_pm.get("Net Profit ($)", 0) - current_pm.get("Net Profit ($)", 0)},
                     {"Metric": "Max Drawdown", "Current sizing": current_pm.get("Max Drawdown ($)", 0), "RP advisory sizing": advisory_pm.get("Max Drawdown ($)", 0), "Change": advisory_pm.get("Max Drawdown ($)", 0) - current_pm.get("Max Drawdown ($)", 0)},
                     {"Metric": "Daily P&L risk", "Current sizing": current_daily, "RP advisory sizing": advisory_daily, "Change": advisory_daily - current_daily},
                     {"Metric": "Annualized risk / equity", "Current sizing": current_ann_risk_pct, "RP advisory sizing": advisory_ann_risk_pct, "Change": advisory_ann_risk_pct - current_ann_risk_pct},
